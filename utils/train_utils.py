@@ -134,10 +134,8 @@ def train_model(model, optimizer, dataset, features_info, lambda_weight, T, epoc
             total_loss += loss.item() * bsz
         avg_loss = total_loss / num_samples
         msg = f"Epoch {epoch+1}/{epochs}: Average loss = {avg_loss:.4f}"
-        print(msg)
         logger.info(msg) 
     end_msg = "Training completed."
-    print(end_msg)
     logger.info(end_msg)
 
 def sample_trip(model, cond_tensor,device):
