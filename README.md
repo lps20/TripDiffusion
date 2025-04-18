@@ -23,12 +23,12 @@ python run.py --traindata data/train_data.csv --testdata data/test_data.csv
 
 ### Parameters you can modify:
 
-- `--epochs` (default: 1)
+- `--epochs` (default: 100)
 - `--batch_size` (default: 64)
 - `--lr` (default: 1e-3)
 - `--lambda_weight` (default: 1.0)
-- `--T` (diffusion steps, default: 1)
-- `--num_samples` (per-cluster generation, default: 1)
+- `--T` (diffusion steps, default: 100)
+- `--num_samples` (per-cluster generation, default: 100)
 - `--exp_dir` (optional: custom folder to save model/logs)
 
 ---
