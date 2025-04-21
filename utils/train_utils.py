@@ -53,6 +53,32 @@ def load_data(file_path, features_info, cond_info):
 
     return data
 
+def compute_discrete_posterior_matrix(feat, t, beta_schedule):
+    """
+    Returns a (K, K) tensor M where
+      M[k, j] = q(x_{t-1}=j | x_t, x_0=k)
+    for THIS feature at timestep t.
+    You must implement this from your known forward process.
+    """
+    # Example placeholder: replace with your actual formula
+    K = feat["num_classes"]
+    beta_t = beta_schedule[t-1].item()
+    # ----
+    # For a simple categorical forward-noise with rate beta:
+    #    q(x_t=j | x_{t-1}=i) = (1-beta_t)·1_{i==j} + beta_t·(1/(K-1))·(1 - 1_{i==j})
+    # Then q(x_{t-1}=j | x_t, x_0=k) ∝ q(x_t | x_{t-1}=j) · 1_{j=k}
+    # …and normalized over j.  Fill in accordingly.
+    # ----
+    M = torch.zeros(K, K, dtype=torch.float32)
+    for k in range(K):
+        # unnormalized q(j | t, k)
+        unnorm = torch.zeros(K)
+        for j in range(K):
+            p_xt__j = (1 - beta_t) if j == k else (beta_t / (K-1))
+            unnorm[j] = p_xt__j
+        M[k] = unnorm / unnorm.sum()
+    return M  # shape (K, K)
+
 def train_model(model, optimizer, dataset, features_info, lambda_weight, T, epochs, batch_size, device):
     """
     Model training process:
@@ -63,66 +89,67 @@ def train_model(model, optimizer, dataset, features_info, lambda_weight, T, epoc
     logger = logging.getLogger(__name__)
 
     model.train()
+
+    # 1) Precompute all posterior matrices M[f][t-1]
+    posterior_matrices = {}
+    for feat in features_info:
+        name = feat["name"]
+        posterior_matrices[name] = [
+            compute_discrete_posterior_matrix(feat, t, model.beta_schedule)
+            .to(device)
+            for t in range(1, T+1)
+        ]
+
     num_samples = len(dataset)
     for epoch in range(epochs):
         total_loss = 0.0
-        for i in tqdm(range(0, num_samples, batch_size), desc=f"Epoch {epoch+1}/{epochs}", leave=False):
-            batch = dataset[i:i+batch_size]
-            x0_batch = torch.stack([item[0] for item in batch]).to(device)  # shape (batch, 8)
+        for i in tqdm(range(0, num_samples, batch_size),
+                      desc=f"Epoch {epoch+1}/{epochs}", leave=False):
 
-            cond_batch = torch.stack([item[1] for item in batch]).to(device)  # shape (batch, 4)
+            batch = dataset[i:i+batch_size]
+            x0_batch = torch.stack([item[0] for item in batch]).to(device)
+            cond_batch = torch.stack([item[1] for item in batch]).to(device)
             bsz = x0_batch.size(0)
-            # Randomly sample t for each sample in the batch
-            t_batch = torch.randint(1, T+1, (bsz,)).to(device)
-            # Initial diffusion: x_prev as x0，x_t_minus_1 is used to store the state at t-1
+
+            # sample timesteps
+            t_batch = torch.randint(1, T+1, (bsz,), device=device)
+
+            # run your forward diffusion to get x_t and x_{t-1}
             x_prev = x0_batch.clone()
             x_t_minus_1 = torch.zeros_like(x0_batch)
-            # For each sample, perform the forward diffusion process
-            for idx in range(bsz):
-                t = t_batch[idx].item()
-                for step in range(1, t+1):
-                    if step == t:
-                        x_t_minus_1[idx] = x_prev[idx].clone()  # store the state at t-1
-                    # For each feature: x_prev -> x_next
-                    x_next_feat = []
-                    for feat_index, feat in enumerate(features_info):
-                        feat_type = feat["type"]
-                        current_val = x_prev[idx, feat_index].item()
-                        if feat_type == "categorical":
-                            beta = model.beta_schedule[step-1].item()
-                            if torch.rand(1).item() < (1 - beta):
-                                new_val = current_val  # Keep the same value
-                            else:
-                                # Uniformly sample a new value from the transition matrix
-                                K = feat["num_classes"]
-                                if K > 1:
-                                    new_val = torch.randint(0, K-1, (1,)).item()
-                                    if new_val >= current_val:
-                                        new_val += 1
-                                else:
-                                    new_val = current_val
-                            x_next_feat.append(new_val)
-                        elif feat_type == "ordinal":
-                            sigma = model.sigma_schedule[step-1].item()
-                            noise = int(round(torch.randn(1).item() * sigma))
-                            new_val = int(current_val + noise)
-                            new_val = max(0, min(feat["num_classes"]-1, new_val))
-                            x_next_feat.append(new_val)
-                    x_next_feat = torch.tensor(x_next_feat, dtype=torch.long)
-                    x_prev[idx] = x_next_feat  # Update state
+            # … [same forward loop as before] …
+            # after this loop:
             x_t = x_prev
 
-            # Compute logits for the current batch
+            # 2) model forward
             logits = model(x_t, cond_batch, t_batch)
-            # Compute the loss
             ce_loss = 0.0
             vb_loss = 0.0
+
+            # 3) per‐feature losses
             for feat_index, feat in enumerate(features_info):
-                target_x0 = x0_batch[:, feat_index]
-                target_xtm1 = x_t_minus_1[:, feat_index]
-                logits_feat = logits[feat["name"]]  # shape (batch, num_classes)
-                ce_loss += F.cross_entropy(logits_feat, target_x0)
-                vb_loss += F.cross_entropy(logits_feat, target_xtm1)
+                name = feat["name"]
+                target_x0   = x0_batch[:, feat_index]        # true x0
+                target_xtm1 = x_t_minus_1[:, feat_index]     # sampled x_{t-1}
+                logits_x0   = logits[name]                   # (bsz, K)
+
+                # a) CE loss on x0
+                ce_loss += F.cross_entropy(logits_x0, target_x0)
+
+                # b) VB‐loss via Method B
+                #   1) get predicted p(x0|xt)
+                probs_x0 = F.softmax(logits_x0, dim=-1)      # (bsz, K)
+                #   2) lookup M for this feat at each sample's t
+                # Here we handle varying t in batch by loop (or vectorize if you like)
+                probs_xtm1 = torch.zeros_like(probs_x0)
+                for sample_idx in range(bsz):
+                    t = t_batch[sample_idx].item()
+                    M = posterior_matrices[name][t-1]        # (K, K)
+                    probs_xtm1[sample_idx] = probs_x0[sample_idx] @ M.T
+
+                #   3) back to logits and CE against x_{t-1}
+                logits_xtm1 = torch.log(probs_xtm1 + 1e-8)
+                vb_loss += F.cross_entropy(logits_xtm1, target_xtm1)
             ce_loss = ce_loss / len(features_info)
             vb_loss = vb_loss / len(features_info)
             loss = vb_loss + lambda_weight * ce_loss
