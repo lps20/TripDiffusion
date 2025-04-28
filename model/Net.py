@@ -97,6 +97,33 @@ class TripDiffusionModel(nn.Module):
                 Q_bar = Q_bar_prev @ Q_t  # matrix multiplication
                 self.cum_transitions[name].append(Q_bar)
                 Q_bar_prev = Q_bar
+        #   build posterior matrices for every t, for every feat
+        #   posterior[name][t] has shape (K, K, K), 
+        #   where posterior[name][t][k, j, i] = q(x_{t-1}=j | x_t=i, x_0=k)
+        self.posterior = {}
+        for feat in features_info:
+            name = feat["name"]
+            K = feat["num_classes"]
+            post_list = []
+            for t in range(1, T+1):
+                Q_t      = self.transitions[name][t-1]      # (K,K): from x_{t-1}->x_t
+                Q_bar_tm1= self.cum_transitions[name][t-1]  # (K,K): from x0->x_{t-1}
+                Q_bar_t  = self.cum_transitions[name][t]    # (K,K): from x0->x_t
+
+                # shape manip:
+                #   Q_bar_tm1.unsqueeze(2):    (K, K, 1)
+                #   Q_t.        unsqueeze(0):  (1, K, K)
+                # → broadcast mul → (K, K, K) with axes (x0, x_{t-1}, x_t)
+                num = Q_bar_tm1.unsqueeze(2) * Q_t.unsqueeze(0)
+
+                # denom[k,i] = Q_bar_t[k,i], reshape to (K,1,K) so we divide num[k, j, i]
+                denom = Q_bar_t.unsqueeze(1).clamp(min=1e-12)
+
+                M_2d = (num/denom).sum(dim=0)                     # (K,K) after summing out x_t
+                post_list.append(M_2d)
+
+            # stack into a single tensor of shape (T, K, K, K)
+            self.posterior[name] = torch.stack(post_list, dim=0)
 
     def forward(self, x_t, cond, t):
         """
