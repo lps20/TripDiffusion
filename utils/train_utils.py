@@ -53,31 +53,6 @@ def load_data(file_path, features_info, cond_info):
 
     return data
 
-def compute_discrete_posterior_matrix(feat, t, beta_schedule):
-    """
-    Returns a (K, K) tensor M where
-      M[k, j] = q(x_{t-1}=j | x_t, x_0=k)
-    for THIS feature at timestep t.
-    You must implement this from your known forward process.
-    """
-    # Example placeholder: replace with your actual formula
-    K = feat["num_classes"]
-    beta_t = beta_schedule[t-1].item()
-    # ----
-    # For a simple categorical forward-noise with rate beta:
-    #    q(x_t=j | x_{t-1}=i) = (1-beta_t)·1_{i==j} + beta_t·(1/(K-1))·(1 - 1_{i==j})
-    # Then q(x_{t-1}=j | x_t, x_0=k) ∝ q(x_t | x_{t-1}=j) · 1_{j=k}
-    # …and normalized over j.  Fill in accordingly.
-    # ----
-    M = torch.zeros(K, K, dtype=torch.float32)
-    for k in range(K):
-        # unnormalized q(j | t, k)
-        unnorm = torch.zeros(K)
-        for j in range(K):
-            p_xt__j = (1 - beta_t) if j == k else (beta_t / (K-1))
-            unnorm[j] = p_xt__j
-        M[k] = unnorm / unnorm.sum()
-    return M  # shape (K, K)
 
 def train_model(model, optimizer, dataset, features_info, lambda_weight, T, epochs, batch_size, device):
     """
@@ -89,16 +64,6 @@ def train_model(model, optimizer, dataset, features_info, lambda_weight, T, epoc
     logger = logging.getLogger(__name__)
 
     model.train()
-
-    # 1) Precompute all posterior matrices M[f][t-1]
-    posterior_matrices = {}
-    for feat in features_info:
-        name = feat["name"]
-        posterior_matrices[name] = [
-            compute_discrete_posterior_matrix(feat, t, model.beta_schedule)
-            .to(device)
-            for t in range(1, T+1)
-        ]
 
     num_samples = len(dataset)
     for epoch in range(epochs):
@@ -117,7 +82,39 @@ def train_model(model, optimizer, dataset, features_info, lambda_weight, T, epoc
             # run your forward diffusion to get x_t and x_{t-1}
             x_prev = x0_batch.clone()
             x_t_minus_1 = torch.zeros_like(x0_batch)
-            # … [same forward loop as before] …
+            # For each sample, perform the forward diffusion process
+            for idx in range(bsz):
+                t = t_batch[idx].item()
+                for step in range(1, t+1):
+                    if step == t:
+                        x_t_minus_1[idx] = x_prev[idx].clone()  # store the state at t-1
+                    # For each feature: x_prev -> x_next
+                    x_next_feat = []
+                    for feat_index, feat in enumerate(features_info):
+                        feat_type = feat["type"]
+                        current_val = x_prev[idx, feat_index].item()
+                        if feat_type == "categorical":
+                            beta = model.beta_schedule[step-1].item()
+                            if torch.rand(1).item() < (1 - beta):
+                                new_val = current_val  # Keep the same value
+                            else:
+                                # Uniformly sample a new value from the transition matrix
+                                K = feat["num_classes"]
+                                if K > 1:
+                                    new_val = torch.randint(0, K-1, (1,)).item()
+                                    if new_val >= current_val:
+                                        new_val += 1
+                                else:
+                                    new_val = current_val
+                            x_next_feat.append(new_val)
+                        elif feat_type == "ordinal":
+                            sigma = model.sigma_schedule[step-1].item()
+                            noise = int(round(torch.randn(1).item() * sigma))
+                            new_val = int(current_val + noise)
+                            new_val = max(0, min(feat["num_classes"]-1, new_val))
+                            x_next_feat.append(new_val)
+                    x_next_feat = torch.tensor(x_next_feat, dtype=torch.long)
+                    x_prev[idx] = x_next_feat  # Update state
             # after this loop:
             x_t = x_prev
 
@@ -129,26 +126,27 @@ def train_model(model, optimizer, dataset, features_info, lambda_weight, T, epoc
             # 3) per‐feature losses
             for feat_index, feat in enumerate(features_info):
                 name = feat["name"]
-                target_x0   = x0_batch[:, feat_index]        # true x0
-                target_xtm1 = x_t_minus_1[:, feat_index]     # sampled x_{t-1}
-                logits_x0   = logits[name]                   # (bsz, K)
-
-                # a) CE loss on x0
+                # --- a) CE loss on x0
+                logits_x0 = logits[name]                          # (bsz, K)
+                target_x0 = x0_batch[:, feat_index]               # (bsz,)
                 ce_loss += F.cross_entropy(logits_x0, target_x0)
 
-                # b) VB‐loss via Method B
-                #   1) get predicted p(x0|xt)
-                probs_x0 = F.softmax(logits_x0, dim=-1)      # (bsz, K)
-                #   2) lookup M for this feat at each sample's t
-                # Here we handle varying t in batch by loop (or vectorize if you like)
-                probs_xtm1 = torch.zeros_like(probs_x0)
-                for sample_idx in range(bsz):
-                    t = t_batch[sample_idx].item()
-                    M = posterior_matrices[name][t-1]        # (K, K)
-                    probs_xtm1[sample_idx] = probs_x0[sample_idx] @ M.T
+                # --- b) VB-loss via predicted p(x_{t-1}|x_t)
+                # 1) compute p_theta(x0|xt)
+                probs_x0 = F.softmax(logits_x0, dim=-1)           # (bsz, K)
 
-                #   3) back to logits and CE against x_{t-1}
-                logits_xtm1 = torch.log(probs_xtm1 + 1e-8)
+                # 2) gather the right M for each sample's t
+                #    model.posterior[name] has shape (T, K, K)
+                #    t_batch is in [1..T], so we index at t-1
+                M_all    = model.posterior[name].to(device)                  # (T, K, K)
+                M_batch  = M_all[t_batch - 1]                    # (bsz, K, K)
+
+                # 3) do batched mat-mul: (bsz,1,K) @ (bsz,K,K) -> (bsz,1,K) -> (bsz,K)
+                probs_xtm1 = torch.bmm(probs_x0.unsqueeze(1), M_batch).squeeze(1)
+
+                # 4) turn back into “logits” and cross-entropy against sampled x_{t-1}
+                logits_xtm1 = torch.log(probs_xtm1 + 1e-8)        # (bsz, K)
+                target_xtm1 = x_t_minus_1[:, feat_index]          # (bsz,)
                 vb_loss += F.cross_entropy(logits_xtm1, target_xtm1)
             ce_loss = ce_loss / len(features_info)
             vb_loss = vb_loss / len(features_info)
@@ -176,33 +174,63 @@ def sample_trip(model, cond_tensor,device):
     for i, feat in enumerate(model.features_info):
         K = feat["num_classes"]
         x_t[0, i] = torch.randint(0, K, (1,)).to(device)
-    for t in range(model.T, 0, -1):
-        t_tensor = torch.tensor([t]).to(device)
-        with torch.no_grad():
+    with torch.no_grad():
+        for t in range(model.T, 0, -1):
+            # prepare timestep tensor
+            t_tensor = torch.full((1,), t, device=device, dtype=torch.long)
+
+            # 1) model forward → logits for p(x0 | xt)
             logits = model(x_t, cond_tensor.unsqueeze(0).to(device), t_tensor)
-            probs = {name: F.softmax(logits[name], dim=1) for name in logits}
-        x_prev = torch.empty_like(x_t)
-        for feat_index, feat in enumerate(model.features_info):
-            name = feat["name"]
-            K = feat["num_classes"]
-            current_val = x_t[0, feat_index].item()
-            p_theta_x0 = probs[name][0].cpu().numpy()
-            unnorm_probs = torch.zeros(K).to(device)
-            Q_t = model.transitions[name][t-1]
-            Q_bar_t = model.cum_transitions[name][t]
-            Q_bar_tm1 = model.cum_transitions[name][t-1]
-            for a in range(K):
-                weight = 0.0
-                for z in range(K):
-                    if Q_bar_t[z, current_val] < 1e-12:
-                        continue
-                    weight += p_theta_x0[z] * (Q_bar_tm1[z, a].item() * Q_t[a, current_val].item()) / Q_bar_t[z, current_val].item()
-                unnorm_probs[a] = torch.tensor(weight, dtype = torch.float).to(device)
-            if unnorm_probs.sum().item() == 0:
-                unnorm_probs = torch.ones(K)
-            p = unnorm_probs / unnorm_probs.sum()
-            x_prev[0, feat_index] = torch.multinomial(p, num_samples=1)
-        x_t = x_prev
+            # convert to probabilities, squeeze batch
+            probs = {
+                name: F.softmax(logits[name], dim=1)[0]  # shape (K,)
+                for name in logits
+            }
+
+            # 2) sample x_{t-1} for each feature
+            x_prev = torch.empty_like(x_t)
+            for feat_index, feat in enumerate(model.features_info):
+                name = feat["name"]
+                K = feat["num_classes"]
+
+                # current noisy value at time t
+                i = x_t[0, feat_index].item()
+
+                # p_theta(x0 | x_t = i)
+                p_theta = probs[name]              # (K,)
+
+                # fetch one‐step kernels
+                Q_t       = model.transitions[name][t-1].to(device)    # (K_j, K_i)
+                Q_bar_tm1 = model.cum_transitions[name][t-1].to(device)# (K_z, K_j)
+                Q_bar_t   = model.cum_transitions[name][t].to(device)  # (K_z, K_i)
+
+                # build the 3-D numerator: (K_z, K_j, K_i)
+                num   = Q_bar_tm1.unsqueeze(2) * Q_t.unsqueeze(0)
+                # build denominator (K_z,1,K_i) and avoid zeros
+                denom = Q_bar_t.unsqueeze(1).clamp(min=1e-12)
+
+                # full posterior: (K_z, K_j, K_i)
+                M_all = num / denom
+
+                # slice out the current x_t = i column → (K_z, K_j)
+                M_slice = M_all[:, :, i]
+
+                # weight[j] = sum_z p_theta[z] * M_slice[z, j]
+                # -> (1,K_z) @ (K_z, K_j) = (1, K_j) -> squeeze -> (K_j,)
+                weight = p_theta.unsqueeze(0).mm(M_slice).squeeze(0)
+
+                # fallback to uniform if underflow
+                if weight.sum() <= 0:
+                    prob = torch.ones(K, device=device) / K
+                else:
+                    prob = weight / weight.sum()
+
+                # multinomial draw
+                x_prev[0, feat_index] = torch.multinomial(prob, num_samples=1)
+
+            # set up for next reverse step
+            x_t = x_prev
+
     return x_t[0]
 
 def sample_condition_from_cluster(clustered_df, cluster_id,features_info, cond_info):
