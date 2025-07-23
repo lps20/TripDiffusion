@@ -1,6 +1,7 @@
 import argparse
 import pandas as pd
 import torch
+from torch import nn
 import torch.optim as optim
 import logging
 import os
@@ -68,6 +69,8 @@ def main(args):
 
 
     model = TripDiffusionModel(features_info, cond_info, T).to(device)
+    if args.parallel == True:
+        model = nn.DataParallel(model)
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
     lambda_weight = args.lambda_weight
     
@@ -121,6 +124,7 @@ if __name__ == "__main__":
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
     parser.add_argument("--lambda_weight", type=float, default=1.0, help="Weight for auxiliary loss")
     parser.add_argument("--T", type=int, default=100, help="Diffusion steps")
+    parser.add_argument("--parallel", type=bool, default=True, help="Parallel computing")
     parser.add_argument("--num_samples", type=int, default=100, help="Number of samples of each cluster to generate after training")
     parser.add_argument("--exp_dir", type=str, default=None, help="Directory to save logs and models (default: auto timestamp)")
     args = parser.parse_args()

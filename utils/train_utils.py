@@ -62,7 +62,8 @@ def train_model(model, optimizer, dataset, features_info, lambda_weight, T, epoc
       - Backpropagate and update the model parameters.
     """
     logger = logging.getLogger(__name__)
-
+    if hasattr(model, 'module'):
+        model = model.module
     model.train()
 
     num_samples = len(dataset)

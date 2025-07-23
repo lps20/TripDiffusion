@@ -60,8 +60,12 @@ class TripDiffusionModel(nn.Module):
         ## Diffusion forward process parameters (for q)
         # Noise schedules (beta for categorical, sigma for ordinal)
         # Using simple linear schedules for demonstration
-        self.beta_schedule = torch.linspace(0.1, 0.5, steps=T)         # e.g., from 0.1 to 0.5
-        self.sigma_schedule = torch.linspace(5.0, 50.0, steps=T)       # e.g., from 5 to 50 (for Gaussian noise)
+        beta_schedule = torch.linspace(0.1, 0.5, steps=T)         # e.g., from 0.1 to 0.5
+        sigma_schedule = torch.linspace(5.0, 50.0, steps=T)       # e.g., from 5 to 50 (for Gaussian noise)
+
+        # assume beta_schedule, sigma_schedule are torch.Tensor of shape (T,)
+        self.register_buffer('beta_schedule',  beta_schedule)
+        self.register_buffer('sigma_schedule', sigma_schedule)
 
         # Precompute transition matrices Q_t for each feature type and cumulative products Q_bar
         self.transitions = {}         # Q_t matrices per feature per step
