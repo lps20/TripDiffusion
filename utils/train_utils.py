@@ -274,6 +274,92 @@ def sample_trip(model, cond_tensor,device):
 
     return x_t[0]
 
+def fast_sample_trips(model, cond_batch, device):
+    """
+    Batch sampling: Generates multiple trips in parallel.
+    cond_batch: Tensor of shape (Batch_Size, Num_Cond_Features)
+    """
+    model.eval()
+    bsz = cond_batch.shape[0]
+    num_features = len(model.features_info)
+    
+    # 1. Initialize x_T randomly
+    x_t = torch.empty((bsz, num_features), dtype=torch.long).to(device)
+    for i, feat in enumerate(model.features_info):
+        K = feat["num_classes"]
+        x_t[:, i] = torch.randint(0, K, (bsz,)).to(device)
+
+    with torch.no_grad():
+        # Reverse diffusion process T -> 1
+        for t in range(model.T, 0, -1):
+            # Construct time tensor (Batch_Size,)
+            t_batch = torch.full((bsz,), t, device=device, dtype=torch.long)
+
+            # 2. Model Forward (process entire batch at once)
+            # Note: If your model forward returns (logits, joint_logits), unpack here
+            model_output = model(x_t, cond_batch, t_batch)
+            if isinstance(model_output, tuple):
+                logits, _ = model_output # Ignore joint_logits
+            else:
+                logits = model_output
+
+            # 3. Sample each feature
+            x_prev_list = []
+            for feat_index, feat in enumerate(model.features_info):
+                name = feat["name"]
+                K = feat["num_classes"]
+                
+                # Get current Batch's x_t values and predicted p(x0)
+                curr_x_t = x_t[:, feat_index]            # (B,)
+                logits_feat = logits[name]               # (B, K)
+                p_theta = F.softmax(logits_feat, dim=1)  # (B, K) -> predicted p(x0)
+
+                # Get matrices (from buffer or list)
+                # Q_t: x_{t-1} -> x_t
+                Q_t = model.transitions[name][t-1]       # (K, K)
+                # Q_bar_tm1: x_0 -> x_{t-1}
+                Q_bar_tm1 = model.cum_transitions[name][t-1] # (K, K)
+                # Q_bar_t: x_0 -> x_t
+                Q_bar_t = model.cum_transitions[name][t]     # (K, K)
+
+                # --- Vectorized Posterior Calculation ---
+                # Formula: p(x_{t-1}|x_t) \propto Q_t(x_{t-1}, x_t) * sum_x0 [ (p(x0)/Q_bar_t(x0, x_t)) * Q_bar_tm1(x0, x_{t-1}) ]
+                
+                # A. Calculate denominator Q_bar_t(x0, x_t) -> select columns corresponding to x_t
+                # Q_bar_t is (Rows=x0, Cols=xt), we need to select Cols=curr_x_t
+                # Result shape: (B, K) (denominator for each sample in batch for x0 distribution)
+                denom = Q_bar_t[:, curr_x_t].t() # Transpose -> (B, K)
+
+                # B. Calculate ratio p(x0) / Q_bar_t
+                ratio = p_theta / denom.clamp(min=1e-12) # (B, K)
+
+                # C. Matrix multiplication sum: ratio @ Q_bar_tm1
+                # (B, K) @ (K, K) -> (B, K)
+                # This step completes the weighted sum over x0
+                mix_prob = torch.matmul(ratio, Q_bar_tm1) # (B, K) represents x_{t-1} distribution part
+
+                # D. Multiply by forward transition probabilities Q_t(x_{t-1}, x_t)
+                # Q_t is (Rows=xt-1, Cols=xt), we need to select Cols=curr_x_t
+                q_t_probs = Q_t[:, curr_x_t].t() # (B, K)
+
+                # E. Final unnormalized probabilities
+                out_probs = mix_prob * q_t_probs # (B, K)
+
+                # F. Normalize and sample
+                out_probs = out_probs / out_probs.sum(dim=1, keepdim=True).clamp(min=1e-12)
+                
+                # Handle NaNs due to numerical instability
+                out_probs = torch.where(torch.isnan(out_probs), torch.ones_like(out_probs)/K, out_probs)
+
+                # Batch Multinomial Sampling
+                next_val = torch.multinomial(out_probs, 1).squeeze(1) # (B,)
+                x_prev_list.append(next_val)
+
+            # Update x_t
+            x_t = torch.stack(x_prev_list, dim=1) # (B, Num_Features)
+
+    return x_t
+
 def sample_condition_from_cluster(clustered_df, cluster_id,features_info, cond_info):
     cond_features = [cond["name"] for cond in cond_info]
     trip_features = [feat["name"] for feat in features_info]
@@ -286,23 +372,67 @@ def sample_condition_from_cluster(clustered_df, cluster_id,features_info, cond_i
     return torch.tensor(condition, dtype=torch.long), true_trip
 
 def sample_trip_by_clusters(model, clustered_df, num_samples_each, device):
+    """
+    Modified to use batch sampling for speed up.
+    """
     results = {}
     clusters = sorted(clustered_df["Cluster"].unique())
     truth_trip = {}
+
+    model.eval()
+
+    MAX_BATCH_SIZE = 512
     for cluster_id in tqdm(clusters, desc="Processing clusters"):
         results[cluster_id] = []
         truth_trip[cluster_id] = []
-        for _ in tqdm(range(num_samples_each), desc=f"Cluster {cluster_id} samples", leave=False):
-            cond_tensor, true_trip = sample_condition_from_cluster(clustered_df, cluster_id, model.features_info, model.cond_info)
-            truth_trip[cluster_id].append({
-                "condition": cond_tensor.tolist(),
-                "trip": true_trip
-            })
-            trip = sample_trip(model, cond_tensor,device)
+
+        cluster_data = clustered_df[clustered_df["Cluster"] == cluster_id]
+        if cluster_data.empty:
+            continue
+
+        # Generate num_samples_each samples for this cluster
+        # First generate all conditions
+        cond_features = [cond["name"] for cond in model.cond_info]
+        trip_features = [feat["name"] for feat in model.features_info]
+        
+        # Randomly sample num_samples_each real samples as the source of Conditions
+        sampled_rows = cluster_data.sample(n=num_samples_each, replace=True)
+        
+        # Construct Condition Tensor (Total_Samples, Cond_Dim)
+        all_conds = []
+        all_truth = []
+        for _, row in sampled_rows.iterrows():
+            c = [int(row[feat]) for feat in cond_features]
+            t = [int(row[feat]) for feat in trip_features]
+            all_conds.append(c)
+            all_truth.append(t)
+            
+        all_conds_tensor = torch.tensor(all_conds, dtype=torch.long).to(device)
+
+        # Batch Sampling in batches
+        generated_trips_list = []
+        for i in range(0, num_samples_each, MAX_BATCH_SIZE):
+            batch_cond = all_conds_tensor[i : i + MAX_BATCH_SIZE]
+            
+            # === Call the new accelerated function ===
+            batch_generated = fast_sample_trips(model, batch_cond, device)
+            # =======================
+            
+            generated_trips_list.append(batch_generated.cpu())
+
+        # Organize results
+        all_generated = torch.cat(generated_trips_list, dim=0).tolist()
+        
+        for idx in range(num_samples_each):
             results[cluster_id].append({
-                "condition": cond_tensor.tolist(),
-                "trip": trip.tolist()
+                "condition": all_conds[idx],
+                "trip": all_generated[idx]
             })
+            truth_trip[cluster_id].append({
+                "condition": all_conds[idx],
+                "trip": all_truth[idx]
+            })
+        
     return results, truth_trip
 
 def save_generated_samples(generated_samples, output_file):
