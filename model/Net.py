@@ -139,6 +139,52 @@ class TripDiffusionModel(nn.Module):
             # stack into a single tensor of shape (T, K, K, K)
             self.posterior[name] = torch.stack(post_list, dim=0)
 
+        # Precompute transition matrices Q_t and Q_bar
+        self.transitions = nn.ParameterDict()     # use nn.ParameterDict to register as buffers
+        self.cum_transitions = nn.ParameterDict()
+
+        for feat in features_info:
+            name = feat["name"]
+            K = feat["num_classes"]
+            feat_type = feat["type"]
+            
+            # 临时列表用于构建 tensor
+            trans_list = []
+            cum_trans_list = []
+            
+            Q_bar_prev = torch.eye(K)
+            
+            # Action：cum_transitions need to include t=0 (Identity) to t=T
+            # transitions need to include t=1 to t=T (corresponding to indices 0 to T-1)
+            cum_trans_list.append(Q_bar_prev) 
+
+            for t in range(T):
+                if feat_type == "categorical":
+                    beta_t = self.beta_schedule[t].item()
+                    if K == 1:
+                        Q_t = torch.eye(1)
+                    else:
+                        Q_t = torch.full((K, K), beta_t/(K-1))
+                        Q_t.fill_diagonal_(1 - beta_t)
+                elif feat_type == "ordinal":
+                    sigma_t = self.sigma_schedule[t].item()
+                    idx = torch.arange(K).unsqueeze(1)
+                    jdx = torch.arange(K).unsqueeze(0)
+                    dist_sq = (idx - jdx).float().pow(2)
+                    Q_t = torch.exp(- dist_sq / (2 * sigma_t**2))
+                    Q_t = Q_t / Q_t.sum(dim=1, keepdim=True)
+                
+                trans_list.append(Q_t)
+                Q_bar = Q_bar_prev @ Q_t
+                cum_trans_list.append(Q_bar)
+                Q_bar_prev = Q_bar
+            
+            # Stack and register as buffers (this will automatically move with the model to GPU)
+            # transitions shape: (T, K, K)
+            self.register_buffer(f'trans_{name}', torch.stack(trans_list))
+            # cum_transitions shape: (T+1, K, K)
+            self.register_buffer(f'cum_trans_{name}', torch.stack(cum_trans_list))
+
     def forward(self, x_t, cond, t):
         """
         Perform a forward pass of the network.
@@ -180,7 +226,7 @@ class TripDiffusionModel(nn.Module):
             name = feat["name"]
             logits[name] = self.output_heads[name](h)
 
-        joint_logits = {}
+        joint_logits = []
         for i, head in enumerate(self.joint_heads):
             joint_logits.append(head(h))
             

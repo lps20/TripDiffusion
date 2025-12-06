@@ -85,43 +85,35 @@ def train_model(model, optimizer, dataset, features_info, lambda_weight, lambda_
             t_batch = torch.randint(1, T+1, (bsz,), device=device)
 
             # run your forward diffusion to get x_t and x_{t-1}
-            x_prev = x0_batch.clone()
-            x_t_minus_1 = torch.zeros_like(x0_batch)
+            x_t_minus_1_list = []
+            x_t_list = []
             # For each sample, perform the forward diffusion process
-            for idx in range(bsz):
-                t = t_batch[idx].item()
-                for step in range(1, t+1):
-                    if step == t:
-                        x_t_minus_1[idx] = x_prev[idx].clone()  # store the state at t-1
-                    # For each feature: x_prev -> x_next
-                    x_next_feat = []
-                    for feat_index, feat in enumerate(features_info):
-                        feat_type = feat["type"]
-                        current_val = x_prev[idx, feat_index].item()
-                        if feat_type == "categorical":
-                            beta = model.beta_schedule[step-1].item()
-                            if torch.rand(1).item() < (1 - beta):
-                                new_val = current_val  # Keep the same value
-                            else:
-                                # Uniformly sample a new value from the transition matrix
-                                K = feat["num_classes"]
-                                if K > 1:
-                                    new_val = torch.randint(0, K-1, (1,)).item()
-                                    if new_val >= current_val:
-                                        new_val += 1
-                                else:
-                                    new_val = current_val
-                            x_next_feat.append(new_val)
-                        elif feat_type == "ordinal":
-                            sigma = model.sigma_schedule[step-1].item()
-                            noise = int(round(torch.randn(1).item() * sigma))
-                            new_val = int(current_val + noise)
-                            new_val = max(0, min(feat["num_classes"]-1, new_val))
-                            x_next_feat.append(new_val)
-                    x_next_feat = torch.tensor(x_next_feat, dtype=torch.long)
-                    x_prev[idx] = x_next_feat  # Update state
+            for feat_index, feat in enumerate(features_info):
+                name = feat["name"]
+                K = feat["num_classes"]
+                
+                # Get current feature values at x0
+                x0_feat = x0_batch[:, feat_index]  # (bsz,)
+
+                # 1. Get cumulative matrices Q_bar(t-1): x0 -> x_t-1
+                cum_matrices = getattr(model, f'cum_trans_{name}')[t_batch - 1]  # (bsz, K, K)
+                # Get one-step transition matrices Q(t): x_t-1 -> x_t
+                step_matrices = getattr(model, f'trans_{name}')[t_batch - 1]  # (bsz, K, K)
+
+                # 2. Sample x_t-1 given x0
+                probs_tm1 = cum_matrices.gather(1, x0_feat.view(-1, 1, 1).expand(-1, 1, K)).squeeze(1) # (B, K)
+
+                x_tm1_feat = torch.multinomial(probs_tm1.clamp(min=0), 1).squeeze(1) # (B,)
+                x_t_minus_1_list.append(x_tm1_feat)
+
+                # 3. Sample x_t given x_{t-1}
+                probs_t = step_matrices.gather(1, x_tm1_feat.view(-1, 1, 1).expand(-1, 1, K)).squeeze(1) # (B, K)
+                x_t_feat = torch.multinomial(probs_t.clamp(min=0), 1).squeeze(1) # (B,)
+                x_t_list.append(x_t_feat)
+
             # after this loop:
-            x_t = x_prev
+            x_t_minus_1 = torch.stack(x_t_minus_1_list, dim=1)
+            x_t = torch.stack(x_t_list, dim=1)
 
             # 2) model forward
             logits, joint_logits = model(x_t, cond_batch, t_batch)
