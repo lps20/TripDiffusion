@@ -4,11 +4,12 @@ import torch.optim as optim
 
 
 class TripDiffusionModel(nn.Module):
-    def __init__(self, features_info, cond_info, T):
+    def __init__(self, features_info, cond_info, T, joint_pairs=None):
         super().__init__()
         self.features_info = features_info
         self.cond_info = cond_info
         self.T = T
+        self.joint_pairs = joint_pairs if joint_pairs is not None else []  # Add important feature pairs
 
         self.features_info = features_info
         self.cond_info = cond_info
@@ -56,6 +57,15 @@ class TripDiffusionModel(nn.Module):
             name = feat["name"]
             num_classes = feat["num_classes"]
             self.output_heads[name] = nn.Linear(hidden_dim, num_classes)
+
+        # Joint heads
+        self.joint_heads = nn.ModuleList()
+        for (idx1, idx2) in self.joint_pairs:
+            feat1 = features_info[idx1]
+            feat2 = features_info[idx2]
+            joint_dim = feat1["num_classes"] * feat2["num_classes"]
+            # Create a linear layer for joint prediction
+            self.joint_heads.append(nn.Linear(hidden_dim, joint_dim))
         
         ## Diffusion forward process parameters (for q)
         # Noise schedules (beta for categorical, sigma for ordinal)
@@ -169,4 +179,9 @@ class TripDiffusionModel(nn.Module):
         for feat in self.features_info:
             name = feat["name"]
             logits[name] = self.output_heads[name](h)
-        return logits
+
+        joint_logits = {}
+        for i, head in enumerate(self.joint_heads):
+            joint_logits.append(head(h))
+            
+        return logits, joint_logits

@@ -6,4 +6,5 @@ venv/
 exp/
 *.bat
 *.sh
+*.ipynb
 figs/

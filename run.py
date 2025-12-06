@@ -6,6 +6,8 @@ import torch.optim as optim
 import logging
 import os
 import datetime
+import argparse
+import ast
 
 from model.Net import TripDiffusionModel
 import utils.train_utils, utils.test_utils
@@ -61,6 +63,11 @@ def main(args):
         {"name": "job_type", "num_classes": 9}
     ]
 
+    try:
+        joint_pairs_list = ast.literal_eval(args.joint_pairs)
+        print(f"Joint pairs loaded: {joint_pairs_list}") # 调试打印，确认格式正确
+    except (ValueError, SyntaxError):
+        raise ValueError("joint_pairs invalid format. Please provide a valid list of tuples, e.g., '[(0,4),(1,5)]'") 
     T = args.T  # diffusion steps
     
     # Set device (CPU or GPU)
@@ -68,7 +75,7 @@ def main(args):
     logging.info(f"Using device: {device}")
 
 
-    model = TripDiffusionModel(features_info, cond_info, T).to(device)
+    model = TripDiffusionModel(features_info, cond_info, T, joint_pairs_list).to(device)
     if args.parallel == True:
         model = nn.DataParallel(model)
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
@@ -127,5 +134,6 @@ if __name__ == "__main__":
     parser.add_argument("--parallel", type=bool, default=True, help="Parallel computing")
     parser.add_argument("--num_samples", type=int, default=100, help="Number of samples of each cluster to generate after training")
     parser.add_argument("--exp_dir", type=str, default=None, help="Directory to save logs and models (default: auto timestamp)")
+    parser.add_argument("--joint_pairs", type=str, default="[(0,4),(1,5),(3,6),(3,7)]", help="List of joint feature pairs for joint loss, e.g., [(0,4),(1,5)]")
     args = parser.parse_args()
     main(args)

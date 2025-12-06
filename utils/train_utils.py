@@ -66,6 +66,8 @@ def train_model(model, optimizer, dataset, features_info, lambda_weight, T, epoc
         model = model.module
     model.train()
 
+    lambda_joint = 0.5  # Weight for joint loss
+
     num_samples = len(dataset)
     for epoch in range(epochs):
         total_loss = 0.0
@@ -120,7 +122,7 @@ def train_model(model, optimizer, dataset, features_info, lambda_weight, T, epoc
             x_t = x_prev
 
             # 2) model forward
-            logits = model(x_t, cond_batch, t_batch)
+            logits, joint_logits = model(x_t, cond_batch, t_batch)
             ce_loss = 0.0
             vb_loss = 0.0
 
@@ -151,7 +153,26 @@ def train_model(model, optimizer, dataset, features_info, lambda_weight, T, epoc
                 vb_loss += F.cross_entropy(logits_xtm1, target_xtm1)
             ce_loss = ce_loss / len(features_info)
             vb_loss = vb_loss / len(features_info)
-            loss = vb_loss + lambda_weight * ce_loss
+
+            # 4) joint losses for important feature pairs
+            joint_loss_val = 0.0
+            if len(model.joint_pairs) > 0:
+                for idx, (feat_idx1, feat_idx2) in enumerate(model.joint_pairs):
+                    K2 = features_info[feat_idx2]["num_classes"]
+                    # Create Joint Target Labels: label = val1 * K2 + val2
+                    # This converts the combination of two features into a unique integer ID
+                    target_1 = x0_batch[:, feat_idx1]
+                    target_2 = x0_batch[:, feat_idx2]
+                    target_joint = target_1 * K2 + target_2
+                    
+                    # Calculate Cross Entropy
+                    joint_loss_val += F.cross_entropy(joint_logits[idx], target_joint)
+                
+                # Average Joint Loss
+                joint_loss_val = joint_loss_val / len(model.joint_pairs)
+
+
+            loss = vb_loss + lambda_weight * ce_loss + lambda_joint * joint_loss_val
 
             optimizer.zero_grad()
             loss.backward()
