@@ -92,11 +92,22 @@ def main(args):
         logging.info("No dataset file provided. Generating synthetic data.")
         dataset = utils.train_utils.generate_synthetic_trips(num_samples=1000)
 
-    utils.train_utils.train_model(model, optimizer, dataset, features_info, lambda_weight, lambda_joint, T,
-                              epochs=args.epochs, batch_size=args.batch_size, device=device)
+    utils.train_utils.train_model(
+        model, 
+        optimizer, 
+        dataset, 
+        features_info, 
+        lambda_weight, 
+        lambda_joint, 
+        T, 
+        epochs=args.epochs, 
+        batch_size=args.batch_size, 
+        device=device,
+        model_save_path=model_file,
+        patience=args.patience,
+        min_delta=args.min_delta)
 
     # Save the trained model
-    torch.save(model.state_dict(), model_file)
     logging.info("Model saved to %s", model_file)
 
     # Generate samples from the trained model
@@ -127,6 +138,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train TripDiffusionModel and generate samples.")
     parser.add_argument("--traindata", type=str, default="data/train_data.csv", help="Path to training dataset CSV file")
     parser.add_argument("--testdata", type=str, default="data/test_data.csv", help="Path to testing dataset CSV file")
+    parser.add_argument("--patience", type=int, default=20, help="Number of epochs to wait for improvement before early stopping.")
+    parser.add_argument("--min_delta", type=float, default=1e-4, help="Minimum change in loss to qualify as an improvement.")
     parser.add_argument("--epochs", type=int, default=100, help="Number of training epochs")
     parser.add_argument("--batch_size", type=int, default=64, help="Batch size for training")
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")

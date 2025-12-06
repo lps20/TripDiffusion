@@ -54,7 +54,7 @@ def load_data(file_path, features_info, cond_info):
     return data
 
 
-def train_model(model, optimizer, dataset, features_info, lambda_weight, lambda_joint, T, epochs, batch_size, device):
+def train_model(model, optimizer, dataset, features_info, lambda_weight, lambda_joint, T, epochs, batch_size, device, model_save_path=None, patience=10, min_delta=1e-4):
     """
     Model training process:
       - For each batch, do the diffusion process based on random step t.
@@ -65,7 +65,11 @@ def train_model(model, optimizer, dataset, features_info, lambda_weight, lambda_
     if hasattr(model, 'module'):
         model = model.module
     model.train()
-    
+
+    # --- Early Stopping Variables ---
+    best_loss = float('inf')
+    patience_counter = 0
+
     num_samples = len(dataset)
     for epoch in range(epochs):
         total_loss = 0.0
@@ -179,9 +183,34 @@ def train_model(model, optimizer, dataset, features_info, lambda_weight, lambda_
             total_loss += loss.item() * bsz
         avg_loss = total_loss / num_samples
         msg = f"Epoch {epoch+1}/{epochs}: Average loss = {avg_loss:.4f}"
+
+        # --- Early Stopping Check ---
+        if avg_loss < best_loss - min_delta:
+            best_loss = avg_loss
+            patience_counter = 0
+            msg += " (New best model saved!)"
+            
+            # 4. 保存模型状态
+            if model_save_path:
+                torch.save(model.state_dict(), model_save_path)
+        else:
+            patience_counter += 1
+            msg += f" (Patience: {patience_counter}/{patience})"
+
         logger.info(msg) 
+
+        if patience_counter >= patience:
+            logger.info(f"Early stopping triggered after {epoch+1} epochs (patience {patience}).")
+            break
     end_msg = "Training completed."
     logger.info(end_msg)
+
+    if model_save_path:
+        logger.info(f"Loading best model weights from {model_save_path}")
+        if hasattr(model, 'module'):
+            model.module.load_state_dict(torch.load(model_save_path, map_location=device))
+        else:
+            model.load_state_dict(torch.load(model_save_path, map_location=device))
 
 def sample_trip(model, cond_tensor,device):
     """
