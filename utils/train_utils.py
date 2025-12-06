@@ -279,19 +279,23 @@ def fast_sample_trips(model, cond_batch, device):
     Batch sampling: Generates multiple trips in parallel.
     cond_batch: Tensor of shape (Batch_Size, Num_Cond_Features)
     """
+    if hasattr(model, 'module'):
+        attr_model = model.module
+    else:
+        attr_model = model
     model.eval()
     bsz = cond_batch.shape[0]
-    num_features = len(model.features_info)
+    num_features = len(attr_model.features_info)
     
     # 1. Initialize x_T randomly
     x_t = torch.empty((bsz, num_features), dtype=torch.long).to(device)
-    for i, feat in enumerate(model.features_info):
+    for i, feat in enumerate(attr_model.features_info):
         K = feat["num_classes"]
         x_t[:, i] = torch.randint(0, K, (bsz,)).to(device)
 
     with torch.no_grad():
         # Reverse diffusion process T -> 1
-        for t in range(model.T, 0, -1):
+        for t in range(attr_model.T, 0, -1):
             # Construct time tensor (Batch_Size,)
             t_batch = torch.full((bsz,), t, device=device, dtype=torch.long)
 
@@ -305,7 +309,7 @@ def fast_sample_trips(model, cond_batch, device):
 
             # 3. Sample each feature
             x_prev_list = []
-            for feat_index, feat in enumerate(model.features_info):
+            for feat_index, feat in enumerate(attr_model.features_info):
                 name = feat["name"]
                 K = feat["num_classes"]
                 
@@ -316,12 +320,11 @@ def fast_sample_trips(model, cond_batch, device):
 
                 # Get matrices (from buffer or list)
                 # Q_t: x_{t-1} -> x_t
-                Q_t = model.transitions[name][t-1]       # (K, K)
+                Q_t = getattr(attr_model, f'trans_{name}')[t-1]       # (K, K)
                 # Q_bar_tm1: x_0 -> x_{t-1}
-                Q_bar_tm1 = model.cum_transitions[name][t-1] # (K, K)
+                Q_bar_tm1 = getattr(attr_model, f'cum_trans_{name}')[t-1] # (K, K)
                 # Q_bar_t: x_0 -> x_t
-                Q_bar_t = model.cum_transitions[name][t]     # (K, K)
-
+                Q_bar_t = getattr(attr_model, f'cum_trans_{name}')[t]     # (K, K)
                 # --- Vectorized Posterior Calculation ---
                 # Formula: p(x_{t-1}|x_t) \propto Q_t(x_{t-1}, x_t) * sum_x0 [ (p(x0)/Q_bar_t(x0, x_t)) * Q_bar_tm1(x0, x_{t-1}) ]
                 
@@ -375,6 +378,11 @@ def sample_trip_by_clusters(model, clustered_df, num_samples_each, device):
     """
     Modified to use batch sampling for speed up.
     """
+    if hasattr(model, 'module'):
+        attr_model = model.module
+    else:
+        attr_model = model
+
     results = {}
     clusters = sorted(clustered_df["Cluster"].unique())
     truth_trip = {}
@@ -392,8 +400,8 @@ def sample_trip_by_clusters(model, clustered_df, num_samples_each, device):
 
         # Generate num_samples_each samples for this cluster
         # First generate all conditions
-        cond_features = [cond["name"] for cond in model.cond_info]
-        trip_features = [feat["name"] for feat in model.features_info]
+        cond_features = [cond["name"] for cond in attr_model.cond_info]
+        trip_features = [feat["name"] for feat in attr_model.features_info]
         
         # Randomly sample num_samples_each real samples as the source of Conditions
         sampled_rows = cluster_data.sample(n=num_samples_each, replace=True)

@@ -11,9 +11,6 @@ class TripDiffusionModel(nn.Module):
         self.T = T
         self.joint_pairs = joint_pairs if joint_pairs is not None else []  # Add important feature pairs
 
-        self.features_info = features_info
-        self.cond_info = cond_info
-
         # Embeddings for each trip feature (categorical or ordinal)
         self.feature_embeddings = nn.ModuleDict()
         for feat in features_info:
