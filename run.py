@@ -80,6 +80,7 @@ def main(args):
         model = nn.DataParallel(model)
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
     lambda_weight = args.lambda_weight
+    lambda_joint = args.lambda_joint
     
     logging.info("Loading Dataset: %s", args.traindata)
     logging.info("Training with %d epochs, batch size %d", args.epochs, args.batch_size)
@@ -91,7 +92,7 @@ def main(args):
         logging.info("No dataset file provided. Generating synthetic data.")
         dataset = utils.train_utils.generate_synthetic_trips(num_samples=1000)
 
-    utils.train_utils.train_model(model, optimizer, dataset, features_info, lambda_weight, T,
+    utils.train_utils.train_model(model, optimizer, dataset, features_info, lambda_weight, lambda_joint, T,
                               epochs=args.epochs, batch_size=args.batch_size, device=device)
 
     # Save the trained model
@@ -130,6 +131,7 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=64, help="Batch size for training")
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
     parser.add_argument("--lambda_weight", type=float, default=1.0, help="Weight for auxiliary loss")
+    parser.add_argument("--lambda_joint", type=float, default=0.5, help="Weight for joint loss")
     parser.add_argument("--T", type=int, default=100, help="Diffusion steps")
     parser.add_argument("--parallel", type=bool, default=True, help="Parallel computing")
     parser.add_argument("--num_samples", type=int, default=100, help="Number of samples of each cluster to generate after training")

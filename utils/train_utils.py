@@ -54,7 +54,7 @@ def load_data(file_path, features_info, cond_info):
     return data
 
 
-def train_model(model, optimizer, dataset, features_info, lambda_weight, T, epochs, batch_size, device):
+def train_model(model, optimizer, dataset, features_info, lambda_weight, lambda_joint, T, epochs, batch_size, device):
     """
     Model training process:
       - For each batch, do the diffusion process based on random step t.
@@ -65,9 +65,7 @@ def train_model(model, optimizer, dataset, features_info, lambda_weight, T, epoc
     if hasattr(model, 'module'):
         model = model.module
     model.train()
-
-    lambda_joint = 0.5  # Weight for joint loss
-
+    
     num_samples = len(dataset)
     for epoch in range(epochs):
         total_loss = 0.0
