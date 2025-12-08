@@ -111,24 +111,21 @@ def main(args):
     logging.info("Model saved to %s", model_file)
 
     # Generate samples from the trained model
-    clustered_df = pd.read_csv(args.testdata)
-    generated_samples, truth_samples = utils.train_utils.sample_trip_by_clusters(model, clustered_df, num_samples_each=args.num_samples, device=device)
+    test_df = pd.read_csv(args.testdata)
+    generated_samples, truth_samples = utils.train_utils.sample_trip(
+        model, 
+        test_df, 
+        num_samples=args.num_samples, # 确保这个参数是你想要的总数 (比如 40000)
+        device=device
+    )
     utils.train_utils.save_generated_samples(generated_samples, output_file = generation_file)
 
 
-    clusters = sorted(clustered_df["Cluster"].unique())
-    truth_trips_all = []
-    generated_trips_all = []
-    for cluster in clusters:
-        logging.info("Evaluating cluster %s", cluster)
-        truth_trips = [sample["trip"] for sample in truth_samples[cluster]]
-        generated_trips = [sample["trip"] for sample in generated_samples[cluster]]
-        truth_trips_all.extend(truth_trips)
-        generated_trips_all.extend(generated_trips)
-        eva = utils.test_utils.evaluate_generated_trips(truth_trips, generated_trips, features_info)
-        logging.info("Evaluation results on cluster %s: %s", cluster, eva)
+    truth_trips_all = [s["trip"] for s in truth_samples]
+    generated_trips_all = [s["trip"] for s in generated_samples]
+    
     eva_all = utils.test_utils.evaluate_generated_trips(truth_trips_all, generated_trips_all, features_info)
-    logging.info("Evaluation results on all clusters: %s", eva_all)
+    logging.info("Evaluation results on all data: %s", eva_all)
 
     logging.info("Training and evaluation completed. Generated samples saved to %s", generation_file)
     print("Training and evaluation completed. Check logs and saved model in:", exp_dir)

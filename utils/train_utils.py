@@ -363,97 +363,86 @@ def fast_sample_trips(model, cond_batch, device):
 
     return x_t
 
-def sample_condition_from_cluster(clustered_df, cluster_id,features_info, cond_info):
-    cond_features = [cond["name"] for cond in cond_info]
-    trip_features = [feat["name"] for feat in features_info]
-    cluster_data = clustered_df[clustered_df["Cluster"] == cluster_id]
-    if cluster_data.empty:
-        raise ValueError(f"No data in class {cluster_id} ")
-    sample_row = cluster_data.sample(n=1).iloc[0]
-    condition = [int(sample_row[feat]) for feat in cond_features]
-    true_trip = [int(sample_row[feat]) for feat in trip_features]
-    return torch.tensor(condition, dtype=torch.long), true_trip
-
-def sample_trip_by_clusters(model, clustered_df, num_samples_each, device):
+def sample_trip(model, df, num_samples, device):
     """
-    Modified to use batch sampling for speed up.
+    Generate samples from the entire dataset without clustering.
+    
+    Args:
+        model: Trained TripDiffusionModel
+        df: The dataframe (test data) to sample conditions from
+        num_samples: Total number of samples to generate
+        device: Torch device
     """
     if hasattr(model, 'module'):
         attr_model = model.module
     else:
         attr_model = model
 
-    results = {}
-    clusters = sorted(clustered_df["Cluster"].unique())
-    truth_trip = {}
-
     model.eval()
+    
+    results = []
+    truth_trip = []
 
-    MAX_BATCH_SIZE = 512
-    for cluster_id in tqdm(clusters, desc="Processing clusters"):
-        results[cluster_id] = []
-        truth_trip[cluster_id] = []
+    cond_features = [cond["name"] for cond in attr_model.cond_info]
+    trip_features = [feat["name"] for feat in attr_model.features_info]
 
-        cluster_data = clustered_df[clustered_df["Cluster"] == cluster_id]
-        if cluster_data.empty:
-            continue
+    print(f"Sampling {num_samples} conditions from dataset...")
+    sampled_rows = df.sample(n=num_samples, replace=True)
 
-        # Generate num_samples_each samples for this cluster
-        # First generate all conditions
-        cond_features = [cond["name"] for cond in attr_model.cond_info]
-        trip_features = [feat["name"] for feat in attr_model.features_info]
+    all_conds = []
+    all_truth = []
+    
+    for _, row in sampled_rows.iterrows():
+        c = [int(row[feat]) for feat in cond_features]
+        t = [int(row[feat]) for feat in trip_features]
+        all_conds.append(c)
+        all_truth.append(t)
+    
+    all_conds_tensor = torch.tensor(all_conds, dtype=torch.long).to(device)
+
+    MAX_BATCH_SIZE = 512 
+    generated_trips_list = []
+    
+    for i in tqdm(range(0, num_samples, MAX_BATCH_SIZE), desc="Generating trips"):
+        batch_cond = all_conds_tensor[i : i + MAX_BATCH_SIZE]
         
-        # Randomly sample num_samples_each real samples as the source of Conditions
-        sampled_rows = cluster_data.sample(n=num_samples_each, replace=True)
-        
-        # Construct Condition Tensor (Total_Samples, Cond_Dim)
-        all_conds = []
-        all_truth = []
-        for _, row in sampled_rows.iterrows():
-            c = [int(row[feat]) for feat in cond_features]
-            t = [int(row[feat]) for feat in trip_features]
-            all_conds.append(c)
-            all_truth.append(t)
-            
-        all_conds_tensor = torch.tensor(all_conds, dtype=torch.long).to(device)
+        batch_generated = fast_sample_trips(model, batch_cond, device)
 
-        # Batch Sampling in batches
-        generated_trips_list = []
-        for i in range(0, num_samples_each, MAX_BATCH_SIZE):
-            batch_cond = all_conds_tensor[i : i + MAX_BATCH_SIZE]
-            
-            # === Call the new accelerated function ===
-            batch_generated = fast_sample_trips(model, batch_cond, device)
-            # =======================
-            
-            generated_trips_list.append(batch_generated.cpu())
+        generated_trips_list.append(batch_generated.cpu())
 
-        # Organize results
-        all_generated = torch.cat(generated_trips_list, dim=0).tolist()
-        
-        for idx in range(num_samples_each):
-            results[cluster_id].append({
-                "condition": all_conds[idx],
-                "trip": all_generated[idx]
-            })
-            truth_trip[cluster_id].append({
-                "condition": all_conds[idx],
-                "trip": all_truth[idx]
-            })
-        
+    all_generated = torch.cat(generated_trips_list, dim=0).tolist()
+    
+    for idx in range(num_samples):
+        results.append({
+            "condition": all_conds[idx],
+            "trip": all_generated[idx]
+        })
+        truth_trip.append({
+            "condition": all_conds[idx],
+            "trip": all_truth[idx]
+        })
+    
     return results, truth_trip
 
 def save_generated_samples(generated_samples, output_file):
+    """
+    Modified to save a flat list of samples (no clusters).
+    """
+    import csv
+
+    headers = ["relation", "sex", "age_code", "job_type", 
+               "start_type", "start_zcode_num", "act_num", 
+               "mode_num", "end_type", "end_zcode_num", 
+               "start_time_num_6", "trip_time_num_6"]
+
     with open(output_file, mode="w", newline="") as csvfile:
         writer = csv.writer(csvfile)
-        writer.writerow(["relation", "sex", "age_code", "job_type", 
-                         "start_type",  "start_zcode_num", "act_num", "mode_num",  "end_type", "end_zcode_num","start_time_num_6",
-                         "trip_time_num_6", "Cluster"])
-        for cluster_id, samples in generated_samples.items():
-            for sample in samples:
-                cond = sample["condition"]
-                trip = sample["trip"]
-                row = cond + trip + [cluster_id]
-                writer.writerow(row)
+        writer.writerow(headers)
+        
+        for sample in generated_samples:
+            cond = sample["condition"]
+            trip = sample["trip"]
+            row = cond + trip 
+            writer.writerow(row)
 
 

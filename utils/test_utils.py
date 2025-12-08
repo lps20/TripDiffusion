@@ -143,37 +143,53 @@ def evaluate_total_variation_distance(truth_trips, generated_trips):
         total_diff += abs(p - q)
     return 0.5 * total_diff
 
+def evaluate_single_feature_jsd(truth_trips, generated_trips, feature_index, num_classes):
+    """
+    Compute JSD between ground truth and generated data for a single feature.
+    """
+    p = get_feature_distribution(truth_trips, feature_index, num_classes)
+    q = get_feature_distribution(generated_trips, feature_index, num_classes)
+    return compute_js_divergence(p, q)
+
+def evaluate_all_features_jsd(truth_trips, generated_trips, features_info):
+    """
+    Compute JSD for all features individually and return a dictionary.
+    """
+    divergences = {}
+    for idx, feat in enumerate(features_info):
+        name = feat["name"]
+        num_classes = feat["num_classes"]
+        jsd = evaluate_single_feature_jsd(truth_trips, generated_trips, idx, num_classes)
+        divergences[name] = jsd
+    return divergences
+
 def evaluate_generated_trips(truth_trips, generated_trips, features_info):
     """
-    Evaluate generated trip data by computing the following metrics:
-      1. KL divergence for individual features
-      2. KL divergence for joint distribution
-      3. Jensen-Shannon Divergence for joint distribution
-      4. Total Variation Distance for joint distribution
+    Evaluate generated trip data by computing JSD metrics (aligned with the paper).
+    
+    Metrics:
+      1. JSD for individual features (Single JSD)
+      2. JSD for joint distribution (Joint JSD)
 
     Parameters:
-      truth_trips: List of ground truth trip data, each element is a list or array of features
-      generated_trips: List of generated trip data, same format as truth_trips
-      features_info: List of feature config dictionaries, each containing "name" and "num_classes"
+      truth_trips: List of ground truth trip data
+      generated_trips: List of generated trip data
+      features_info: List of feature config dictionaries
 
     Returns:
-      A dictionary containing values for all evaluation metrics
+      A dictionary containing values for JSD metrics.
     """
-    # 1. KL divergence for individual features
-    single_feature_kl = evaluate_all_features_kl(truth_trips, generated_trips, features_info)
+    # 1. JSD for individual features (替代原来的 Single KL)
+    single_feature_jsd = evaluate_all_features_jsd(truth_trips, generated_trips, features_info)
     
-    # 2. KL divergence for joint distribution
-    joint_kl = evaluate_joint_kl(truth_trips, generated_trips)
-    
-    # 3. Jensen-Shannon Divergence for joint distribution
+    # 2. Jensen-Shannon Divergence for joint distribution (Joint JSD)
     joint_js = evaluate_joint_js_divergence(truth_trips, generated_trips)
     
-    # 4. Total Variation Distance for joint distribution
-    tvd = evaluate_total_variation_distance(truth_trips, generated_trips)
+    # 如果你还需要 TVD 或 Joint KL 作为参考，可以保留，但根据你的要求，这里只返回 JSD
+    # joint_kl = evaluate_joint_kl(truth_trips, generated_trips)
+    # tvd = evaluate_total_variation_distance(truth_trips, generated_trips)
     
     return {
-        "single_feature_kl": single_feature_kl,
-        "joint_kl": joint_kl,
-        "joint_js": joint_js,
-        "tvd": tvd
+        "single_feature_jsd": single_feature_jsd,
+        "joint_js": joint_js
     }
