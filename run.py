@@ -115,7 +115,7 @@ def main(args):
     generated_samples, truth_samples = utils.train_utils.sample_trip(
         model, 
         test_df, 
-        num_samples=args.num_samples, # 确保这个参数是你想要的总数 (比如 40000)
+        num_samples=args.num_samples,
         device=device
     )
     utils.train_utils.save_generated_samples(generated_samples, output_file = generation_file)
@@ -138,14 +138,14 @@ if __name__ == "__main__":
     parser.add_argument("--patience", type=int, default=20, help="Number of epochs to wait for improvement before early stopping.")
     parser.add_argument("--min_delta", type=float, default=1e-4, help="Minimum change in loss to qualify as an improvement.")
     parser.add_argument("--epochs", type=int, default=100, help="Number of training epochs")
-    parser.add_argument("--batch_size", type=int, default=64, help="Batch size for training")
+    parser.add_argument("--batch_size", type=int, default=500, help="Batch size for training")
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
     parser.add_argument("--lambda_weight", type=float, default=1.0, help="Weight for auxiliary loss")
     parser.add_argument("--lambda_joint", type=float, default=0.5, help="Weight for joint loss")
     parser.add_argument("--T", type=int, default=100, help="Diffusion steps")
     parser.add_argument("--parallel", type=bool, default=True, help="Parallel computing")
-    parser.add_argument("--num_samples", type=int, default=100, help="Number of samples of each cluster to generate after training")
+    parser.add_argument("--num_samples", type=int, default=10000, help="Number of samples to generate after training")
     parser.add_argument("--exp_dir", type=str, default=None, help="Directory to save logs and models (default: auto timestamp)")
-    parser.add_argument("--joint_pairs", type=str, default="[(0,4),(1,5),(3,6),(3,7)]", help="List of joint feature pairs for joint loss, e.g., [(0,4),(1,5)]")
+    parser.add_argument("--joint_pairs", type=str, default="[(0,4),(1,5),(2,6),(3,6),(2,3),(6,7)]", help="List of joint feature pairs for joint loss, e.g., [(0,4),(1,5)]")
     args = parser.parse_args()
     main(args)
