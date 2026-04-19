@@ -1,5 +1,7 @@
 import numpy as np
 import pandas as pd
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import accuracy_score, f1_score
 
 def compute_kl_divergence(p, q, eps=1e-10):
     """
@@ -41,7 +43,10 @@ def get_feature_distribution(trips, feature_index, num_classes):
     """
     counts = np.zeros(num_classes)
     for trip in trips:
-        val = trip[feature_index]
+        try:
+            val = int(round(float(trip[feature_index])))
+        except (ValueError, TypeError):
+            continue
         if 0 <= val < num_classes:
             counts[val] += 1
     if counts.sum() == 0:
@@ -163,7 +168,204 @@ def evaluate_all_features_jsd(truth_trips, generated_trips, features_info):
         divergences[name] = jsd
     return divergences
 
-def evaluate_generated_trips(truth_trips, generated_trips, features_info):
+def _build_samples_dataframe(samples, cond_info, features_info):
+    """
+    Convert sampled records from train_utils.sample_trip format into a flat DataFrame.
+    Each sample item should be:
+      {"condition": [...], "trip": [...]}
+    """
+    if samples is None or cond_info is None:
+        return None
+
+    cond_cols = [c["name"] if isinstance(c, dict) else str(c) for c in cond_info]
+    trip_cols = [f["name"] if isinstance(f, dict) else str(f) for f in features_info]
+
+    rows = []
+    for item in samples:
+        cond = item.get("condition", None)
+        trip = item.get("trip", None)
+        if cond is None or trip is None:
+            continue
+        if len(cond) != len(cond_cols) or len(trip) != len(trip_cols):
+            continue
+        row = {}
+        for i, col in enumerate(cond_cols):
+            row[col] = cond[i]
+        for i, col in enumerate(trip_cols):
+            row[col] = trip[i]
+        rows.append(row)
+
+    if len(rows) == 0:
+        return None
+    return pd.DataFrame(rows)
+
+def _sanitize_int_columns(df, columns):
+    out = df.copy()
+    for c in columns:
+        if c not in out.columns:
+            continue
+        out[c] = pd.to_numeric(out[c], errors='coerce').fillna(0).round().astype(int)
+    return out
+
+def evaluate_logical_validity_rate(generated_df):
+    """
+    Compute Logical Validity Rate (LVR).
+
+    Invalid if any rule is violated:
+      1) Demographics-Mode mismatch: underage driving private car.
+      2) Activity-Mode mismatch.
+      3) Activity-Location mismatch.
+    """
+    needed_cols = ["age_code", "act_num", "mode_num", "start_type"]
+    if generated_df is None or any(c not in generated_df.columns for c in needed_cols):
+        return {
+            "logical_validity_rate": None,
+            "n_total": 0,
+            "n_valid": 0,
+            "n_invalid": 0,
+            "invalid_rule_breakdown": {
+                "demographics_mode_mismatch": 0,
+                "activity_mode_mismatch": 0,
+                "activity_location_mismatch": 0
+            }
+        }
+
+    df = _sanitize_int_columns(generated_df, needed_cols)
+
+    age = df["age_code"]
+    act = df["act_num"]
+    mode = df["mode_num"]
+    start_type = df["start_type"]
+
+    # age_code is 0-based in this project (0~12), so under 18 -> codes <= 1.
+    underage_driving = (age <= 1) & (mode == 5)
+
+    stationary_acts = {0, 2, 3, 4, 5, 6, 8}
+    moving_modes = {3, 4, 5, 6, 7, 8}
+    stationary_modes = {0, 1, 2}
+    activity_mode_mismatch = ((act == 1) & mode.isin(stationary_modes)) | (
+        act.isin(stationary_acts) & mode.isin(moving_modes)
+    )
+
+    # start_type is 0-based: 0=home,1=workplace,2=school,3/4=other buckets
+    activity_location_mismatch = (
+        ((act == 0) & start_type.isin([1, 2])) |
+        ((act == 2) & start_type.isin([0, 2])) |
+        ((act == 3) & start_type.isin([0, 1]))
+    )
+
+    invalid = underage_driving | activity_mode_mismatch | activity_location_mismatch
+
+    n_total = int(len(df))
+    n_invalid = int(invalid.sum())
+    n_valid = n_total - n_invalid
+    lvr = 1.0 - (n_invalid / max(n_total, 1))
+
+    return {
+        "logical_validity_rate": float(lvr),
+        "n_total": n_total,
+        "n_valid": n_valid,
+        "n_invalid": n_invalid,
+        "invalid_rule_breakdown": {
+            "demographics_mode_mismatch": int(underage_driving.sum()),
+            "activity_mode_mismatch": int(activity_mode_mismatch.sum()),
+            "activity_location_mismatch": int(activity_location_mismatch.sum())
+        }
+    }
+
+def evaluate_tstr_predictive_accuracy(
+    synthetic_df,
+    train_real_df,
+    test_real_df,
+    cond_info,
+    features_info,
+    random_state=42
+):
+    """
+    TSTR/TRTR utility evaluation:
+      target: mode_num
+      model: RandomForest
+      metrics: macro F1 and accuracy
+    """
+    target_col = "mode_num"
+    all_cols = [c["name"] for c in cond_info] + [f["name"] for f in features_info]
+
+    if synthetic_df is None or train_real_df is None or test_real_df is None:
+        return {
+            "tstr_macro_f1": None,
+            "trtr_macro_f1": None,
+            "tstr_accuracy": None,
+            "trtr_accuracy": None,
+            "tstr_trtr_f1_ratio": None
+        }
+
+    required = set(all_cols)
+    if not required.issubset(set(synthetic_df.columns)):
+        return {
+            "tstr_macro_f1": None,
+            "trtr_macro_f1": None,
+            "tstr_accuracy": None,
+            "trtr_accuracy": None,
+            "tstr_trtr_f1_ratio": None
+        }
+    if not required.issubset(set(train_real_df.columns)) or not required.issubset(set(test_real_df.columns)):
+        return {
+            "tstr_macro_f1": None,
+            "trtr_macro_f1": None,
+            "tstr_accuracy": None,
+            "trtr_accuracy": None,
+            "tstr_trtr_f1_ratio": None
+        }
+
+    feature_cols = [c for c in all_cols if c != target_col]
+
+    syn = _sanitize_int_columns(synthetic_df, all_cols)
+    tr = _sanitize_int_columns(train_real_df, all_cols)
+    te = _sanitize_int_columns(test_real_df, all_cols)
+
+    X_syn, y_syn = syn[feature_cols], syn[target_col]
+    X_tr, y_tr = tr[feature_cols], tr[target_col]
+    X_te, y_te = te[feature_cols], te[target_col]
+
+    rf_kwargs = {
+        "n_estimators": 200,
+        "random_state": random_state,
+        "n_jobs": 1,
+        "class_weight": "balanced_subsample"
+    }
+
+    clf_tstr = RandomForestClassifier(**rf_kwargs)
+    clf_tstr.fit(X_syn, y_syn)
+    pred_tstr = clf_tstr.predict(X_te)
+
+    clf_trtr = RandomForestClassifier(**rf_kwargs)
+    clf_trtr.fit(X_tr, y_tr)
+    pred_trtr = clf_trtr.predict(X_te)
+
+    tstr_f1 = float(f1_score(y_te, pred_tstr, average="macro"))
+    trtr_f1 = float(f1_score(y_te, pred_trtr, average="macro"))
+    tstr_acc = float(accuracy_score(y_te, pred_tstr))
+    trtr_acc = float(accuracy_score(y_te, pred_trtr))
+
+    return {
+        "tstr_macro_f1": tstr_f1,
+        "trtr_macro_f1": trtr_f1,
+        "tstr_accuracy": tstr_acc,
+        "trtr_accuracy": trtr_acc,
+        "tstr_trtr_f1_ratio": float(tstr_f1 / max(trtr_f1, 1e-12))
+    }
+
+def evaluate_generated_trips(
+    truth_trips,
+    generated_trips,
+    features_info,
+    generated_samples=None,
+    cond_info=None,
+    generated_df=None,
+    train_real_df=None,
+    test_real_df=None,
+    random_state=42
+):
     """
     Evaluate generated trip data by computing JSD metrics (aligned with the paper).
     
@@ -189,7 +391,28 @@ def evaluate_generated_trips(truth_trips, generated_trips, features_info):
     # joint_kl = evaluate_joint_kl(truth_trips, generated_trips)
     # tvd = evaluate_total_variation_distance(truth_trips, generated_trips)
     
-    return {
+    results = {
         "single_feature_jsd": single_feature_jsd,
         "joint_js": joint_js
     }
+
+    # LVR and TSTR require condition + trip columns.
+    # Priority: explicit generated_df; fallback to generated_samples list.
+    if generated_df is None:
+        generated_df = _build_samples_dataframe(generated_samples, cond_info, features_info)
+
+    lvr = evaluate_logical_validity_rate(generated_df)
+    results.update(lvr)
+
+    if cond_info is not None:
+        tstr = evaluate_tstr_predictive_accuracy(
+            synthetic_df=generated_df,
+            train_real_df=train_real_df,
+            test_real_df=test_real_df,
+            cond_info=cond_info,
+            features_info=features_info,
+            random_state=random_state
+        )
+        results.update(tstr)
+
+    return results

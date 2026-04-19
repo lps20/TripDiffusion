@@ -1,14 +1,9 @@
+import ast
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
-import math
 import pandas as pd
-import numpy as np
-import csv
 import logging
 from tqdm import tqdm
-
-from model.Net import TripDiffusionModel
 
 def generate_synthetic_trips(num_samples):
     """
@@ -54,7 +49,60 @@ def load_data(file_path, features_info, cond_info):
     return data
 
 
-def train_model(model, optimizer, dataset, features_info, lambda_weight, lambda_joint, T, epochs, batch_size, device, model_save_path=None, patience=10, min_delta=1e-4):
+def _resolve_causal_weights(causal_weight):
+    defaults = {'st': 1.0, 'mode': 1.0}
+    if causal_weight is None:
+        return defaults
+    if isinstance(causal_weight, str):
+        causal_weight = ast.literal_eval(causal_weight)
+    if not isinstance(causal_weight, dict):
+        raise ValueError("causal_weight must be a dict like {'st': 1.0, 'mode': 1.0}")
+
+    resolved = defaults.copy()
+    for key in defaults:
+        if key in causal_weight:
+            resolved[key] = float(causal_weight[key])
+    return resolved
+
+
+def _build_batch_sampling_weights(dataset, features_info, sampling_feature, sampling_power):
+    feature_to_idx = {feat["name"]: i for i, feat in enumerate(features_info)}
+    if sampling_feature not in feature_to_idx:
+        raise ValueError(f"sampling_feature '{sampling_feature}' not found in features_info")
+    feat_idx = feature_to_idx[sampling_feature]
+
+    feat_values = torch.tensor([int(item[0][feat_idx]) for item in dataset], dtype=torch.long)
+    unique_vals, counts = torch.unique(feat_values, return_counts=True)
+    count_map = {int(v.item()): int(c.item()) for v, c in zip(unique_vals, counts)}
+
+    sample_weights = []
+    for v in feat_values.tolist():
+        freq = max(count_map[v], 1)
+        sample_weights.append((1.0 / freq) ** sampling_power)
+    sample_weights = torch.tensor(sample_weights, dtype=torch.float32)
+    sample_weights = sample_weights / sample_weights.sum().clamp(min=1e-12)
+    return sample_weights
+
+
+def _build_timestep_probs(T, t_sampling):
+    if t_sampling == 'uniform':
+        return None
+    steps = torch.arange(1, T + 1, dtype=torch.float32)
+    if t_sampling == 'sqrt':
+        weights = torch.sqrt(steps)
+    elif t_sampling == 'late':
+        weights = steps
+    else:
+        raise ValueError(f"Unknown t_sampling strategy: {t_sampling}")
+    return weights / weights.sum()
+
+
+def train_model(model, optimizer, dataset, features_info, 
+                lambda_weight, lambda_joint, T, epochs, batch_size, device,
+                loss_type='standard',causal_weight=None,
+                model_save_path=None, patience=10, min_delta=1e-4,
+                batch_sampling='sequential', sampling_feature='act_num',
+                sampling_power=1.0, t_sampling='uniform'):
     """
     Model training process:
       - For each batch, do the diffusion process based on random step t.
@@ -62,27 +110,63 @@ def train_model(model, optimizer, dataset, features_info, lambda_weight, lambda_
       - Backpropagate and update the model parameters.
     """
     logger = logging.getLogger(__name__)
+    
     if hasattr(model, 'module'):
-        model = model.module
+        attr_model = model.module
+    else:
+        attr_model = model
+
     model.train()
 
     # --- Early Stopping Variables ---
     best_loss = float('inf')
     patience_counter = 0
 
+    valid_batch_sampling = {'sequential', 'shuffle', 'balanced'}
+    if batch_sampling not in valid_batch_sampling:
+        raise ValueError(f"batch_sampling must be one of {valid_batch_sampling}, got '{batch_sampling}'")
+
+    causal_weights = _resolve_causal_weights(causal_weight)
+    t_probs = _build_timestep_probs(T, t_sampling)
+    sample_weights = None
+    if batch_sampling == 'balanced':
+        sample_weights = _build_batch_sampling_weights(
+            dataset=dataset,
+            features_info=features_info,
+            sampling_feature=sampling_feature,
+            sampling_power=sampling_power
+        )
+
+    logger.info(
+        "Sampling config: batch_sampling=%s, sampling_feature=%s, sampling_power=%.3f, t_sampling=%s",
+        batch_sampling, sampling_feature, sampling_power, t_sampling
+    )
+
     num_samples = len(dataset)
     for epoch in range(epochs):
         total_loss = 0.0
-        for i in tqdm(range(0, num_samples, batch_size),
-                      desc=f"Epoch {epoch+1}/{epochs}", leave=False):
 
-            batch = dataset[i:i+batch_size]
+        pbar = tqdm(range(0, num_samples, batch_size), desc=f"Epoch {epoch+1}/{epochs}", leave=False)
+
+        if batch_sampling == 'sequential':
+            epoch_indices = torch.arange(num_samples, dtype=torch.long)
+        elif batch_sampling == 'shuffle':
+            epoch_indices = torch.randperm(num_samples)
+        else:
+            epoch_indices = torch.multinomial(sample_weights, num_samples, replacement=True)
+
+        for i in pbar:
+            batch_indices = epoch_indices[i:i+batch_size].tolist()
+            batch = [dataset[idx] for idx in batch_indices]
             x0_batch = torch.stack([item[0] for item in batch]).to(device)
             cond_batch = torch.stack([item[1] for item in batch]).to(device)
             bsz = x0_batch.size(0)
 
             # sample timesteps
-            t_batch = torch.randint(1, T+1, (bsz,), device=device)
+            if t_probs is None:
+                t_batch = torch.randint(1, T+1, (bsz,), device=device)
+            else:
+                t_batch = torch.multinomial(t_probs, bsz, replacement=True).to(device) + 1
 
             # run your forward diffusion to get x_t and x_{t-1}
             x_t_minus_1_list = []
@@ -90,24 +174,28 @@ def train_model(model, optimizer, dataset, features_info, lambda_weight, lambda_
             # For each sample, perform the forward diffusion process
             for feat_index, feat in enumerate(features_info):
                 name = feat["name"]
-                K = feat["num_classes"]
                 
                 # Get current feature values at x0
                 x0_feat = x0_batch[:, feat_index]  # (bsz,)
 
                 # 1. Get cumulative matrices Q_bar(t-1): x0 -> x_t-1
-                cum_matrices = getattr(model, f'cum_trans_{name}')[t_batch - 1]  # (bsz, K, K)
+                cum_matrices = getattr(attr_model, f'cum_trans_{name}')[t_batch - 1]
                 # Get one-step transition matrices Q(t): x_t-1 -> x_t
-                step_matrices = getattr(model, f'trans_{name}')[t_batch - 1]  # (bsz, K, K)
+                step_matrices = getattr(attr_model, f'trans_{name}')[t_batch - 1]
+                state_dim = step_matrices.size(-1)
 
                 # 2. Sample x_t-1 given x0
-                probs_tm1 = cum_matrices.gather(1, x0_feat.view(-1, 1, 1).expand(-1, 1, K)).squeeze(1) # (B, K)
+                probs_tm1 = cum_matrices.gather(
+                    1, x0_feat.view(-1, 1, 1).expand(-1, 1, state_dim)
+                ).squeeze(1)
 
                 x_tm1_feat = torch.multinomial(probs_tm1.clamp(min=0), 1).squeeze(1) # (B,)
                 x_t_minus_1_list.append(x_tm1_feat)
 
                 # 3. Sample x_t given x_{t-1}
-                probs_t = step_matrices.gather(1, x_tm1_feat.view(-1, 1, 1).expand(-1, 1, K)).squeeze(1) # (B, K)
+                probs_t = step_matrices.gather(
+                    1, x_tm1_feat.view(-1, 1, 1).expand(-1, 1, state_dim)
+                ).squeeze(1)
                 x_t_feat = torch.multinomial(probs_t.clamp(min=0), 1).squeeze(1) # (B,)
                 x_t_list.append(x_t_feat)
 
@@ -117,57 +205,120 @@ def train_model(model, optimizer, dataset, features_info, lambda_weight, lambda_
 
             # 2) model forward
             logits, joint_logits = model(x_t, cond_batch, t_batch)
-            ce_loss = 0.0
-            vb_loss = 0.0
 
-            # 3) per‐feature losses
-            for feat_index, feat in enumerate(features_info):
-                name = feat["name"]
-                # --- a) CE loss on x0
-                logits_x0 = logits[name]                          # (bsz, K)
-                target_x0 = x0_batch[:, feat_index]               # (bsz,)
-                ce_loss += F.cross_entropy(logits_x0, target_x0)
-
-                # --- b) VB-loss via predicted p(x_{t-1}|x_t)
-                # 1) compute p_theta(x0|xt)
-                probs_x0 = F.softmax(logits_x0, dim=-1)           # (bsz, K)
-
-                # 2) gather the right M for each sample's t
-                #    model.posterior[name] has shape (T, K, K)
-                #    t_batch is in [1..T], so we index at t-1
-                M_all    = model.posterior[name].to(device)                  # (T, K, K)
-                M_batch  = M_all[t_batch - 1]                    # (bsz, K, K)
-
-                # 3) do batched mat-mul: (bsz,1,K) @ (bsz,K,K) -> (bsz,1,K) -> (bsz,K)
-                probs_xtm1 = torch.bmm(probs_x0.unsqueeze(1), M_batch).squeeze(1)
-
-                # 4) turn back into “logits” and cross-entropy against sampled x_{t-1}
-                logits_xtm1 = torch.log(probs_xtm1 + 1e-8)        # (bsz, K)
-                target_xtm1 = x_t_minus_1[:, feat_index]          # (bsz,)
-                vb_loss += F.cross_entropy(logits_xtm1, target_xtm1)
-            ce_loss = ce_loss / len(features_info)
-            vb_loss = vb_loss / len(features_info)
-
-            # 4) joint losses for important feature pairs
-            joint_loss_val = 0.0
-            if len(model.joint_pairs) > 0:
-                for idx, (feat_idx1, feat_idx2) in enumerate(model.joint_pairs):
-                    K2 = features_info[feat_idx2]["num_classes"]
-                    # Create Joint Target Labels: label = val1 * K2 + val2
-                    # This converts the combination of two features into a unique integer ID
-                    target_1 = x0_batch[:, feat_idx1]
-                    target_2 = x0_batch[:, feat_idx2]
-                    target_joint = target_1 * K2 + target_2
-                    
-                    # Calculate Cross Entropy
-                    joint_loss_val += F.cross_entropy(joint_logits[idx], target_joint)
+            if loss_type == 'causal':
+                # === New Causal Loss Strategy ===
+                # Logic: L = L_CE(Act) + w1 * L_CE(ST) + w2 * L_CE(Mode) + L_vb
+                # Explicit Joint Loss is REMOVED because the architecture handles dependencies.
                 
-                # Average Joint Loss
-                joint_loss_val = joint_loss_val / len(model.joint_pairs)
+                loss_groups = {'act': 0.0, 'st': 0.0, 'mode': 0.0}
+                vb_loss = 0.0
+                
+                # Check if model has group definitions (CausalChainTransformer)
+                if not hasattr(attr_model, 'group_act_names'):
+                    raise ValueError("Model does not support causal grouping. Use 'standard' loss.")
+
+                for feat_index, feat in enumerate(features_info):
+                    name = feat["name"]
+                    
+                    # A) CE Loss (Reconstruction)
+                    logits_x0 = logits[name]
+                    target_x0 = x0_batch[:, feat_index]
+                    feat_ce = F.cross_entropy(logits_x0, target_x0)
+                    
+                    # Accumulate into groups
+                    if name in attr_model.group_act_names:
+                        loss_groups['act'] += feat_ce
+                    elif name in attr_model.group_st_names:
+                        loss_groups['st'] += feat_ce
+                    elif name in attr_model.group_mode_names:
+                        loss_groups['mode'] += feat_ce
+                    
+                    # B) VB Loss (Optional but recommended for Diffusion)
+                    probs_x0 = F.softmax(logits_x0, dim=-1)
+                    M_batch = getattr(attr_model, f'post_{name}')[t_batch - 1] # Use registered buffer
+                    probs_xtm1 = torch.bmm(probs_x0.unsqueeze(1), M_batch).squeeze(1)
+                    logits_xtm1 = torch.log(probs_xtm1 + 1e-8)
+                    target_xtm1 = x_t_minus_1[:, feat_index]
+                    vb_loss += F.cross_entropy(logits_xtm1, target_xtm1)
+                
+                # Normalize VB loss
+                vb_loss = vb_loss / len(features_info)
+                
+                # Aggregate Causal CE Loss
+                # Formula: L_act + lambda1 * L_st + lambda2 * L_mode
+                causal_ce_loss = (loss_groups['act'] + 
+                                  causal_weights['st'] * loss_groups['st'] + 
+                                  causal_weights['mode'] * loss_groups['mode'])
+                
+                # Total Loss
+                loss = vb_loss + causal_ce_loss
+                
+                # Logging info for progress bar
+                pbar.set_postfix({'vb': f'{vb_loss.item():.2f}', 'c_ce': f'{causal_ce_loss.item():.2f}'})
+
+            elif loss_type == 'standard':
+                ce_loss = 0.0
+                vb_loss = 0.0
+
+                # 3) per‐feature losses
+                for feat_index, feat in enumerate(features_info):
+                    name = feat["name"]
+                    # --- a) CE loss on x0
+                    logits_x0 = logits[name]                          # (bsz, K)
+                    target_x0 = x0_batch[:, feat_index]               # (bsz,)
+                    ce_loss += F.cross_entropy(logits_x0, target_x0)
+
+                    # --- b) VB-loss via predicted p(x_{t-1}|x_t)
+                    # 1) compute p_theta(x0|xt)
+                    probs_x0 = F.softmax(logits_x0, dim=-1)           # (bsz, K)
+
+                    # 2) gather the right M for each sample's t
+                    #    model.posterior[name] has shape (T, K, K)
+                    #    t_batch is in [1..T], so we index at t-1
+                    # M_all    = model.posterior[name].to(device)                  # (T, K, K)
+                    # M_batch  = M_all[t_batch - 1]                    # (bsz, K, K)
+                    if hasattr(attr_model, f'post_{name}'):
+                        M_batch = getattr(attr_model, f'post_{name}')[t_batch - 1]
+                    else:
+                        posterior = attr_model.posterior[name]
+                        if posterior.device != t_batch.device:
+                            M_batch = posterior[(t_batch - 1).cpu()].to(device)
+                        else:
+                            M_batch = posterior[t_batch - 1].to(device)
+
+                    # 3) do batched mat-mul: (bsz,1,K) @ (bsz,K,K) -> (bsz,1,K) -> (bsz,K)
+                    probs_xtm1 = torch.bmm(probs_x0.unsqueeze(1), M_batch).squeeze(1)
+
+                    # 4) turn back into “logits” and cross-entropy against sampled x_{t-1}
+                    logits_xtm1 = torch.log(probs_xtm1 + 1e-8)        # (bsz, K)
+                    target_xtm1 = x_t_minus_1[:, feat_index]          # (bsz,)
+                    vb_loss += F.cross_entropy(logits_xtm1, target_xtm1)
+                ce_loss = ce_loss / len(features_info)
+                vb_loss = vb_loss / len(features_info)
+
+                # 4) joint losses for important feature pairs
+                joint_loss_val = 0.0
+                if len(attr_model.joint_pairs) > 0 and lambda_joint > 0:
+                    for idx, (feat_idx1, feat_idx2) in enumerate(attr_model.joint_pairs):
+                        K2 = features_info[feat_idx2]["num_classes"]
+                        # Create Joint Target Labels: label = val1 * K2 + val2
+                        # This converts the combination of two features into a unique integer ID
+                        target_1 = x0_batch[:, feat_idx1]
+                        target_2 = x0_batch[:, feat_idx2]
+                        target_joint = target_1 * K2 + target_2
+                        
+                        # Calculate Cross Entropy
+                        joint_loss_val += F.cross_entropy(joint_logits[idx], target_joint)
+                    
+                    # Average Joint Loss
+                    joint_loss_val = joint_loss_val / len(attr_model.joint_pairs)
 
 
-            loss = vb_loss + lambda_weight * ce_loss + lambda_joint * joint_loss_val
+                loss = vb_loss + lambda_weight * ce_loss + lambda_joint * joint_loss_val
+                pbar.set_postfix({'loss': f'{loss.item():.2f}'})
 
+            # Backrop
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
@@ -190,6 +341,7 @@ def train_model(model, optimizer, dataset, features_info, lambda_weight, lambda_
             msg += f" (Patience: {patience_counter}/{patience})"
 
         logger.info(msg) 
+        pbar.update(1)
 
         if patience_counter >= patience:
             logger.info(f"Early stopping triggered after {epoch+1} epochs (patience {patience}).")
@@ -199,10 +351,19 @@ def train_model(model, optimizer, dataset, features_info, lambda_weight, lambda_
 
     if model_save_path:
         logger.info(f"Loading best model weights from {model_save_path}")
+
+        state_dict = torch.load(model_save_path, map_location=device)
+
+        from collections import OrderedDict
+        new_state_dict = OrderedDict()
+        for k, v in state_dict.items():
+            new_key = k.replace('module.', '') if k.startswith('module.') else k
+            new_state_dict[new_key] = v
+            
         if hasattr(model, 'module'):
-            model.module.load_state_dict(torch.load(model_save_path, map_location=device))
+            model.module.load_state_dict(new_state_dict)
         else:
-            model.load_state_dict(torch.load(model_save_path, map_location=device))
+            model.load_state_dict(new_state_dict)
 
 def sample_trip(model, cond_tensor,device):
     """
@@ -286,12 +447,19 @@ def fast_sample_trips(model, cond_batch, device):
     model.eval()
     bsz = cond_batch.shape[0]
     num_features = len(attr_model.features_info)
+    mask_token_ids = getattr(attr_model, "mask_token_ids", None)
     
     # 1. Initialize x_T randomly
     x_t = torch.empty((bsz, num_features), dtype=torch.long).to(device)
     for i, feat in enumerate(attr_model.features_info):
-        K = feat["num_classes"]
-        x_t[:, i] = torch.randint(0, K, (bsz,)).to(device)
+        name = feat["name"]
+        trans_mat = getattr(attr_model, f'trans_{name}')
+        state_dim = trans_mat.size(-1)
+        mask_id = None if mask_token_ids is None else mask_token_ids.get(name)
+        if mask_id is not None:
+            x_t[:, i] = mask_id
+        else:
+            x_t[:, i] = torch.randint(0, state_dim, (bsz,)).to(device)
 
     with torch.no_grad():
         # Reverse diffusion process T -> 1
@@ -311,7 +479,6 @@ def fast_sample_trips(model, cond_batch, device):
             x_prev_list = []
             for feat_index, feat in enumerate(attr_model.features_info):
                 name = feat["name"]
-                K = feat["num_classes"]
                 
                 # Get current Batch's x_t values and predicted p(x0)
                 curr_x_t = x_t[:, feat_index]            # (B,)
@@ -350,9 +517,10 @@ def fast_sample_trips(model, cond_batch, device):
 
                 # F. Normalize and sample
                 out_probs = out_probs / out_probs.sum(dim=1, keepdim=True).clamp(min=1e-12)
+                state_dim = out_probs.size(1)
                 
                 # Handle NaNs due to numerical instability
-                out_probs = torch.where(torch.isnan(out_probs), torch.ones_like(out_probs)/K, out_probs)
+                out_probs = torch.where(torch.isnan(out_probs), torch.ones_like(out_probs)/state_dim, out_probs)
 
                 # Batch Multinomial Sampling
                 next_val = torch.multinomial(out_probs, 1).squeeze(1) # (B,)
@@ -360,6 +528,19 @@ def fast_sample_trips(model, cond_batch, device):
 
             # Update x_t
             x_t = torch.stack(x_prev_list, dim=1) # (B, Num_Features)
+
+    # Convert residual mask tokens back to valid class ids for evaluation/export.
+    if mask_token_ids is not None:
+        for feat_index, feat in enumerate(attr_model.features_info):
+            name = feat["name"]
+            mask_id = mask_token_ids.get(name)
+            if mask_id is None:
+                continue
+            valid_classes = feat["num_classes"]
+            is_mask = x_t[:, feat_index] == mask_id
+            if is_mask.any():
+                replacement = torch.randint(0, valid_classes, (int(is_mask.sum().item()),), device=device)
+                x_t[is_mask, feat_index] = replacement
 
     return x_t
 

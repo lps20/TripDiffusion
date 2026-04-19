@@ -21,6 +21,27 @@ Single Run (default settings)
 python run.py --traindata data/train_data.csv --testdata data/test_data.csv
 ```
 
+## Baselines: CTGAN / DATGAN
+
+Install optional baseline dependencies:
+
+```bash
+pip install -r requirements-baselines.txt
+```
+
+Run baseline generation and evaluation:
+
+```bash
+python run_tabular_baselines.py --models ctgan datgan --traindata data/train_data.csv --testdata data/test_data.csv --num_samples 10000
+```
+
+Outputs are saved to `exp/baseline/`:
+- `CTGAN_gene.csv`
+- `DATGAN_gene.csv`
+- `CTGAN_metrics.json`
+- `DATGAN_metrics.json`
+- `baseline_metrics.csv`
+
 ### Parameters you can modify:
 
 - `--epochs` (default: 100)

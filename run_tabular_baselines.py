@@ -1,0 +1,772 @@
+import argparse
+import inspect
+import importlib
+import importlib.metadata
+import json
+import logging
+import os
+import random
+from typing import Any, Dict, List, Optional
+
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
+
+import utils.test_utils
+import utils.train_utils
+
+
+TRIP_SCHEMA = [
+    {"name": "start_type", "num_classes": 5},
+    {"name": "start_time_num_6", "num_classes": 241},
+    {"name": "start_zcode_num", "num_classes": 77},
+    {"name": "act_num", "num_classes": 9},
+    {"name": "mode_num", "num_classes": 9},
+    {"name": "trip_time_num_6", "num_classes": 241},
+    {"name": "end_type", "num_classes": 5},
+    {"name": "end_zcode_num", "num_classes": 77},
+]
+
+COND_COLUMNS = ["relation", "sex", "age_code", "job_type"]
+TRIP_COLUMNS = [f["name"] for f in TRIP_SCHEMA]
+ALL_COLUMNS = COND_COLUMNS + TRIP_COLUMNS
+FULL_SCHEMA = [
+    {"name": "relation", "num_classes": 5},
+    {"name": "sex", "num_classes": 2},
+    {"name": "age_code", "num_classes": 13},
+    {"name": "job_type", "num_classes": 9},
+    *TRIP_SCHEMA,
+]
+
+
+def _set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+
+
+def _filter_kwargs(fn: Any, kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return {}
+
+    params = sig.parameters
+    accepts_var_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+    if accepts_var_kwargs:
+        return kwargs
+    return {k: v for k, v in kwargs.items() if k in params}
+
+
+def _import_ctgan_class():
+    try:
+        module = importlib.import_module("ctgan")
+        return getattr(module, "CTGAN")
+    except Exception as exc:
+        raise ImportError(
+            "CTGAN is not installed. Install with: pip install ctgan"
+        ) from exc
+
+
+def _patch_sklearn_onehot_for_datgan() -> None:
+    """
+    DATGAN expects sklearn.preprocessing.OneHotEncoder(..., sparse=...).
+    Newer sklearn versions renamed this argument to `sparse_output`.
+    """
+    try:
+        import sklearn.preprocessing as sk_pre
+    except Exception:
+        return
+
+    onehot_cls = getattr(sk_pre, "OneHotEncoder", None)
+    if onehot_cls is None:
+        return
+
+    try:
+        sig = inspect.signature(onehot_cls.__init__)
+    except (TypeError, ValueError):
+        return
+
+    has_sparse = "sparse" in sig.parameters
+    has_sparse_output = "sparse_output" in sig.parameters
+    if has_sparse or (not has_sparse_output):
+        return
+
+    base_cls = onehot_cls
+
+    class CompatOneHotEncoder(base_cls):  # type: ignore[misc, valid-type]
+        def __init__(self, *args, sparse=None, **kwargs):
+            if sparse is not None and "sparse_output" not in kwargs:
+                kwargs["sparse_output"] = sparse
+            super().__init__(*args, **kwargs)
+
+    sk_pre.OneHotEncoder = CompatOneHotEncoder
+
+
+def _patch_tensorflow_checkpoint_save_for_datgan() -> None:
+    """
+    DATGAN's training loop always saves a checkpoint at the last epoch.
+    On some Windows setups this rename operation fails; skip checkpoint failure
+    so baseline generation can still finish.
+    """
+    try:
+        import tensorflow as tf
+    except Exception:
+        return
+
+    ckpt_cls = getattr(tf.train, "CheckpointManager", None)
+    if ckpt_cls is None:
+        return
+    if getattr(ckpt_cls, "_datgan_safe_save_patched", False):
+        return
+
+    original_save = ckpt_cls.save
+
+    def _safe_save(self, *args, **kwargs):
+        try:
+            return original_save(self, *args, **kwargs)
+        except Exception as exc:
+            logging.warning("DATGAN checkpoint save failed and was skipped: %s", exc)
+            return None
+
+    ckpt_cls.save = _safe_save
+    ckpt_cls._datgan_safe_save_patched = True
+
+
+def _import_datgan_class():
+    _patch_sklearn_onehot_for_datgan()
+    candidates = [
+        ("datgan", "DATGAN"),
+        ("datgan.datgan", "DATGAN"),
+        ("DATGAN", "DATGAN"),
+    ]
+    import_errors: List[str] = []
+
+    for module_name, class_name in candidates:
+        try:
+            module = importlib.import_module(module_name)
+            if hasattr(module, class_name):
+                _patch_tensorflow_checkpoint_save_for_datgan()
+                return getattr(module, class_name)
+            import_errors.append(f"{module_name}: class `{class_name}` not found")
+        except ModuleNotFoundError:
+            continue
+        except Exception as exc:
+            import_errors.append(f"{module_name}: {type(exc).__name__}: {exc}")
+
+    hints = []
+    try:
+        tf_ver = importlib.metadata.version("tensorflow")
+    except importlib.metadata.PackageNotFoundError:
+        tf_ver = None
+    try:
+        np_ver = importlib.metadata.version("numpy")
+    except importlib.metadata.PackageNotFoundError:
+        np_ver = None
+    try:
+        pb_ver = importlib.metadata.version("protobuf")
+    except importlib.metadata.PackageNotFoundError:
+        pb_ver = None
+
+    if tf_ver is not None or np_ver is not None or pb_ver is not None:
+        hints.append(f"Detected versions -> tensorflow={tf_ver}, numpy={np_ver}, protobuf={pb_ver}")
+    hints.append("For DATGAN(TensorFlow 2.x), use compatible deps, e.g.:")
+    hints.append(
+        "pip install \"numpy<2\" \"protobuf<=3.20.3\" \"tensorflow==2.8.*\" --upgrade --force-reinstall"
+    )
+
+    detail = "; ".join(import_errors) if import_errors else "No DATGAN module candidate could be imported."
+    raise ImportError(
+        "DATGAN is installed but not importable due to dependency/API mismatch. "
+        f"Details: {detail}. {' | '.join(hints)}"
+    )
+
+
+def _sanitize_df_by_schema(df: pd.DataFrame, schema: List[Dict[str, Any]]) -> pd.DataFrame:
+    output = df.copy()
+    for feat in schema:
+        col = feat["name"]
+        if col not in output.columns:
+            raise ValueError(f"Generated data missing required column: {col}")
+        output[col] = pd.to_numeric(output[col], errors="coerce").fillna(0.0)
+        output[col] = output[col].round().astype(int)
+        output[col] = output[col].clip(lower=0, upper=feat["num_classes"] - 1)
+    return output
+
+
+def _full_field_info() -> List[Dict[str, Any]]:
+    return FULL_SCHEMA
+
+
+def _df_to_index_tensor(df: pd.DataFrame, fields: List[Dict[str, Any]]) -> torch.Tensor:
+    arr = np.zeros((len(df), len(fields)), dtype=np.int64)
+    for i, field in enumerate(fields):
+        name = field["name"]
+        k = field["num_classes"]
+        vals = pd.to_numeric(df[name], errors="coerce").fillna(0).round().astype(int).clip(0, k - 1).values
+        arr[:, i] = vals
+    return torch.from_numpy(arr)
+
+
+def _index_tensor_to_df(index_tensor: torch.Tensor, fields: List[Dict[str, Any]]) -> pd.DataFrame:
+    data = index_tensor.detach().cpu().numpy()
+    out = {}
+    for i, field in enumerate(fields):
+        out[field["name"]] = data[:, i].astype(int)
+    return pd.DataFrame(out)
+
+
+def _onehot_batch(x_idx: torch.Tensor, fields: List[Dict[str, Any]]) -> torch.Tensor:
+    parts = []
+    for i, field in enumerate(fields):
+        k = field["num_classes"]
+        parts.append(F.one_hot(x_idx[:, i], num_classes=k).float())
+    return torch.cat(parts, dim=1)
+
+
+class _TabularVAE(nn.Module):
+    def __init__(self, fields: List[Dict[str, Any]], hidden_dim: int = 256, latent_dim: int = 64):
+        super().__init__()
+        self.fields = fields
+        self.total_dim = int(sum(f["num_classes"] for f in fields))
+        self.hidden_dim = hidden_dim
+        self.latent_dim = latent_dim
+
+        self.encoder = nn.Sequential(
+            nn.Linear(self.total_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+        )
+        self.mu_head = nn.Linear(hidden_dim, latent_dim)
+        self.logvar_head = nn.Linear(hidden_dim, latent_dim)
+
+        self.decoder_backbone = nn.Sequential(
+            nn.Linear(latent_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+        )
+        self.decoder_heads = nn.ModuleList([nn.Linear(hidden_dim, f["num_classes"]) for f in fields])
+
+    def encode(self, x_onehot: torch.Tensor) -> (torch.Tensor, torch.Tensor):
+        h = self.encoder(x_onehot)
+        return self.mu_head(h), self.logvar_head(h)
+
+    def reparameterize(self, mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return mu + eps * std
+
+    def decode_logits(self, z: torch.Tensor) -> List[torch.Tensor]:
+        h = self.decoder_backbone(z)
+        return [head(h) for head in self.decoder_heads]
+
+    def forward(self, x_onehot: torch.Tensor) -> (List[torch.Tensor], torch.Tensor, torch.Tensor):
+        mu, logvar = self.encode(x_onehot)
+        z = self.reparameterize(mu, logvar)
+        logits = self.decode_logits(z)
+        return logits, mu, logvar
+
+
+def _run_vae(
+    train_df: pd.DataFrame,
+    n_samples: int,
+    epochs: int,
+    batch_size: int,
+    lr: float,
+    latent_dim: int,
+    hidden_dim: int,
+    beta_kl: float,
+    seed: int,
+) -> pd.DataFrame:
+    _set_seed(seed)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    fields = _full_field_info()
+    x_idx = _df_to_index_tensor(train_df, fields)
+    dataset = TensorDataset(x_idx)
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=False)
+
+    model = _TabularVAE(fields=fields, hidden_dim=hidden_dim, latent_dim=latent_dim).to(device)
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+
+    model.train()
+    for epoch in range(epochs):
+        total_loss = 0.0
+        for (batch_idx,) in loader:
+            batch_idx = batch_idx.to(device)
+            x_onehot = _onehot_batch(batch_idx, fields)
+
+            logits_list, mu, logvar = model(x_onehot)
+            recon_loss = 0.0
+            for i, logits in enumerate(logits_list):
+                recon_loss = recon_loss + F.cross_entropy(logits, batch_idx[:, i])
+            recon_loss = recon_loss / len(fields)
+
+            kl = -0.5 * torch.mean(torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1))
+            loss = recon_loss + beta_kl * kl
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            total_loss += float(loss.item()) * batch_idx.size(0)
+
+        avg_loss = total_loss / max(len(dataset), 1)
+        logging.info("VAE epoch %d/%d avg_loss=%.6f", epoch + 1, epochs, avg_loss)
+
+    model.eval()
+    out_rows = []
+    remaining = n_samples
+    with torch.no_grad():
+        while remaining > 0:
+            bsz = min(batch_size, remaining)
+            z = torch.randn((bsz, latent_dim), device=device)
+            logits_list = model.decode_logits(z)
+            sampled_cols = []
+            for logits in logits_list:
+                probs = F.softmax(logits, dim=1)
+                sampled = torch.multinomial(probs, num_samples=1).squeeze(1)
+                sampled_cols.append(sampled)
+            x_gen = torch.stack(sampled_cols, dim=1)
+            out_rows.append(x_gen.cpu())
+            remaining -= bsz
+
+    x_all = torch.cat(out_rows, dim=0)
+    return _index_tensor_to_df(x_all, fields)
+
+
+def _fit_model_with_discrete_columns(model: Any, train_df: pd.DataFrame, discrete_columns: List[str]) -> None:
+    if hasattr(model, "fit"):
+        fit_fn = model.fit
+    elif hasattr(model, "train"):
+        fit_fn = model.train
+    else:
+        raise AttributeError("Model has neither `fit` nor `train` method.")
+
+    # Some libraries wrap `fit` and hide real signatures behind (*args, **kwargs),
+    # so we try one keyword at a time instead of passing all candidates together.
+    keyword_candidates = [
+        ("discrete_columns", discrete_columns),
+        ("categorical_columns", discrete_columns),
+        ("cat_cols", discrete_columns),
+        ("cat_columns", discrete_columns),
+    ]
+
+    last_unexpected_kw_error: Optional[Exception] = None
+    for kw_name, kw_value in keyword_candidates:
+        try:
+            fit_fn(train_df, **{kw_name: kw_value})
+            return
+        except TypeError as exc:
+            msg = str(exc)
+            if "unexpected keyword argument" in msg:
+                last_unexpected_kw_error = exc
+                continue
+            raise
+
+    try:
+        fit_fn(train_df)
+        return
+    except TypeError as exc:
+        if last_unexpected_kw_error is not None:
+            raise last_unexpected_kw_error
+        raise exc
+
+
+def _sample_model(model: Any, n_samples: int, columns: List[str]) -> pd.DataFrame:
+    if hasattr(model, "sample"):
+        sample_fn = model.sample
+    elif hasattr(model, "generate"):
+        sample_fn = model.generate
+    else:
+        raise AttributeError("Model has neither `sample` nor `generate` method.")
+
+    keyword_candidates = [
+        ("n", n_samples),
+        ("num_rows", n_samples),
+        ("num_samples", n_samples),
+        ("samples", n_samples),
+    ]
+    generated = None
+    last_unexpected_kw_error: Optional[Exception] = None
+    for kw_name, kw_value in keyword_candidates:
+        try:
+            generated = sample_fn(**{kw_name: kw_value})
+            break
+        except TypeError as exc:
+            msg = str(exc)
+            if "unexpected keyword argument" in msg:
+                last_unexpected_kw_error = exc
+                continue
+            raise
+
+    if generated is None:
+        try:
+            generated = sample_fn(n_samples)
+        except TypeError as exc:
+            if last_unexpected_kw_error is not None:
+                raise last_unexpected_kw_error
+            raise exc
+
+    if isinstance(generated, pd.DataFrame):
+        return generated
+
+    generated = np.asarray(generated)
+    if generated.ndim != 2:
+        raise ValueError("Generated output must be 2D tabular data.")
+    if generated.shape[1] != len(columns):
+        raise ValueError(
+            f"Generated output has {generated.shape[1]} columns, expected {len(columns)}."
+        )
+    return pd.DataFrame(generated, columns=columns)
+
+
+def _run_ctgan(
+    train_df: pd.DataFrame,
+    all_columns: List[str],
+    n_samples: int,
+    epochs: int,
+    batch_size: int,
+) -> pd.DataFrame:
+    ctgan_class = _import_ctgan_class()
+    init_kwargs = _filter_kwargs(
+        ctgan_class,
+        {"epochs": epochs, "batch_size": batch_size, "verbose": True},
+    )
+    model = ctgan_class(**init_kwargs)
+    _fit_model_with_discrete_columns(model, train_df[all_columns], all_columns)
+    return _sample_model(model, n_samples, all_columns)
+
+
+def _run_datgan(
+    train_df: pd.DataFrame,
+    all_columns: List[str],
+    n_samples: int,
+    output_dir: str,
+    epochs: int,
+    batch_size: int,
+) -> pd.DataFrame:
+    datgan_class = _import_datgan_class()
+    os.makedirs(output_dir, exist_ok=True)
+    datgan_output = os.path.join(output_dir, "")
+
+    init_kwargs = _filter_kwargs(
+        datgan_class,
+        {
+            "name": "datgan_baseline",
+            "output": datgan_output,
+            "num_epochs": epochs,
+            "batch_size": batch_size,
+            "save_checkpoints": False,
+            "restore_session": False,
+            "verbose": 1,
+        },
+    )
+    model = datgan_class(**init_kwargs)
+
+    # DATGAN requires explicit metadata on first preprocessing.
+    # This dataset is discretized tabular codes, so we treat all columns as categorical by default.
+    metadata = {col: {"type": "categorical"} for col in all_columns}
+    fit_fn = getattr(model, "fit", None)
+    if fit_fn is None:
+        raise AttributeError("DATGAN model has no `fit` method.")
+
+    fit_kwargs = _filter_kwargs(
+        fit_fn,
+        {
+            "metadata": metadata,
+            "preprocessed_data_path": os.path.join(output_dir, "encoded_data"),
+        },
+    )
+    fit_fn(train_df[all_columns], **fit_kwargs)
+    return _sample_model(model, n_samples, all_columns)
+
+
+def _run_ddpm_transformer(
+    train_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    n_samples: int,
+    epochs: int,
+    batch_size: int,
+    lr: float,
+    T: int,
+    lambda_weight: float,
+    lambda_joint: float,
+    seed: int,
+) -> pd.DataFrame:
+    _set_seed(seed)
+    from model.Transformer_Net import TripDiffusionModel as DDPMTransformerModel
+
+    logging.info(
+        "DDPM-Transformer baseline: using ordinal Gaussian noise for continuous variables "
+        "(start_time_num_6, trip_time_num_6)."
+    )
+
+    # Keep feature order consistent with existing diffusion training/sampling pipeline.
+    ddpm_features_info = [
+        {"name": "start_type", "type": "categorical", "num_classes": 5},
+        {"name": "start_zcode_num", "type": "categorical", "num_classes": 77},
+        {"name": "act_num", "type": "categorical", "num_classes": 9},
+        {"name": "mode_num", "type": "categorical", "num_classes": 9},
+        {"name": "end_type", "type": "categorical", "num_classes": 5},
+        {"name": "end_zcode_num", "type": "categorical", "num_classes": 77},
+        # Continuous variables use ordinal state with Gaussian transition noise in DDPM.
+        {"name": "start_time_num_6", "type": "ordinal", "num_classes": 241},
+        {"name": "trip_time_num_6", "type": "ordinal", "num_classes": 241},
+    ]
+    ddpm_cond_info = [
+        {"name": "relation", "num_classes": 5},
+        {"name": "sex", "num_classes": 2},
+        {"name": "age_code", "num_classes": 13},
+        {"name": "job_type", "num_classes": 9},
+    ]
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = DDPMTransformerModel(ddpm_features_info, ddpm_cond_info, T, joint_pairs=[]).to(device)
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+
+    feat_cols = [f["name"] for f in ddpm_features_info]
+    cond_cols = [c["name"] for c in ddpm_cond_info]
+    dataset = []
+    for _, row in train_df.iterrows():
+        x0 = torch.tensor([int(round(float(row[c]))) for c in feat_cols], dtype=torch.long)
+        cond = torch.tensor([int(round(float(row[c]))) for c in cond_cols], dtype=torch.long)
+        dataset.append((x0, cond))
+    utils.train_utils.train_model(
+        model=model,
+        optimizer=optimizer,
+        dataset=dataset,
+        features_info=ddpm_features_info,
+        lambda_weight=lambda_weight,
+        lambda_joint=lambda_joint,
+        T=T,
+        epochs=epochs,
+        batch_size=batch_size,
+        device=device,
+        loss_type="standard",
+        causal_weight=None,
+        model_save_path=None,
+        patience=max(epochs, 1),
+        min_delta=0.0,
+        batch_sampling="shuffle",
+        sampling_feature="act_num",
+        sampling_power=1.0,
+        t_sampling="uniform",
+    )
+
+    generated_samples, _ = utils.train_utils.sample_trip(
+        model=model,
+        df=test_df,
+        num_samples=n_samples,
+        device=device,
+    )
+
+    rows = []
+    ddpm_trip_cols = [f["name"] for f in ddpm_features_info]
+    ddpm_cond_cols = [c["name"] for c in ddpm_cond_info]
+    for sample in generated_samples:
+        row = {}
+        for i, c in enumerate(ddpm_cond_cols):
+            row[c] = int(sample["condition"][i])
+        for i, c in enumerate(ddpm_trip_cols):
+            row[c] = int(sample["trip"][i])
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def _evaluate_and_save(
+    model_name: str,
+    generated_df: pd.DataFrame,
+    sampled_truth_df: pd.DataFrame,
+    train_real_df: pd.DataFrame,
+    test_real_df: pd.DataFrame,
+    output_dir: str,
+    seed: int,
+) -> Dict[str, Any]:
+    generated_df = _sanitize_df_by_schema(generated_df, FULL_SCHEMA)
+    sampled_truth_df = _sanitize_df_by_schema(sampled_truth_df, FULL_SCHEMA)
+    train_real_df = _sanitize_df_by_schema(train_real_df, FULL_SCHEMA)
+    test_real_df = _sanitize_df_by_schema(test_real_df, FULL_SCHEMA)
+
+    generated_trips = generated_df[TRIP_COLUMNS].values.tolist()
+    truth_trips = sampled_truth_df[TRIP_COLUMNS].values.tolist()
+
+    cond_info_for_eval = [{"name": c} for c in COND_COLUMNS]
+    jsd_lvr_tstr_metrics = utils.test_utils.evaluate_generated_trips(
+        truth_trips,
+        generated_trips,
+        TRIP_SCHEMA,
+        cond_info=cond_info_for_eval,
+        generated_df=generated_df[ALL_COLUMNS],
+        train_real_df=train_real_df,
+        test_real_df=test_real_df,
+        random_state=seed
+    )
+
+    metrics = jsd_lvr_tstr_metrics
+
+    model_tag = model_name.upper()
+    output_csv = os.path.join(output_dir, f"{model_tag}_gene.csv")
+    generated_df[ALL_COLUMNS].to_csv(output_csv, index=False)
+
+    metric_json = os.path.join(output_dir, f"{model_tag}_metrics.json")
+    with open(metric_json, "w", encoding="utf-8") as f:
+        json.dump(metrics, f, ensure_ascii=False, indent=2)
+
+    flat_row: Dict[str, Any] = {
+        "model": model_tag,
+        "joint_js": float(metrics["joint_js"]),
+        "logical_validity_rate": float(metrics["logical_validity_rate"]),
+        "tstr_macro_f1": float(metrics["tstr_macro_f1"]),
+        "trtr_macro_f1": float(metrics["trtr_macro_f1"]),
+        "tstr_accuracy": float(metrics["tstr_accuracy"]),
+        "trtr_accuracy": float(metrics["trtr_accuracy"]),
+        "tstr_trtr_f1_ratio": float(metrics["tstr_trtr_f1_ratio"]),
+    }
+    for feat_name, value in metrics["single_feature_jsd"].items():
+        flat_row[f"jsd_{feat_name}"] = float(value)
+    return flat_row
+
+
+def _append_summary(output_dir: str, rows: List[Dict[str, Any]]) -> None:
+    if not rows:
+        return
+    summary_path = os.path.join(output_dir, "baseline_metrics.csv")
+    new_df = pd.DataFrame(rows)
+    if os.path.exists(summary_path):
+        old_df = pd.read_csv(summary_path)
+        keep_old = old_df[~old_df["model"].isin(new_df["model"])]
+        merged = pd.concat([keep_old, new_df], ignore_index=True)
+        merged.to_csv(summary_path, index=False)
+    else:
+        new_df.to_csv(summary_path, index=False)
+
+
+def main(args: argparse.Namespace) -> None:
+    _set_seed(args.seed)
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    logging.info("Arguments: %s", vars(args))
+
+    train_df = pd.read_csv(args.traindata)
+    test_df = pd.read_csv(args.testdata)
+
+    required_columns = set(ALL_COLUMNS)
+    for dataset_name, df in [("train", train_df), ("test", test_df)]:
+        missing = required_columns - set(df.columns)
+        if missing:
+            raise ValueError(f"{dataset_name} dataset missing columns: {sorted(missing)}")
+
+    sampled_truth_df = test_df.sample(
+        n=args.num_samples,
+        replace=True,
+        random_state=args.seed,
+    ).reset_index(drop=True)
+
+    rows = []
+    for model_name in args.models:
+        logging.info("Running baseline: %s", model_name.upper())
+        if model_name == "ctgan":
+            generated_df = _run_ctgan(
+                train_df=train_df,
+                all_columns=ALL_COLUMNS,
+                n_samples=args.num_samples,
+                epochs=args.epochs,
+                batch_size=args.batch_size,
+            )
+        elif model_name == "vae":
+            generated_df = _run_vae(
+                train_df=train_df,
+                n_samples=args.num_samples,
+                epochs=args.epochs,
+                batch_size=args.batch_size,
+                lr=args.lr,
+                latent_dim=args.vae_latent_dim,
+                hidden_dim=args.vae_hidden_dim,
+                beta_kl=args.vae_beta_kl,
+                seed=args.seed,
+            )
+        elif model_name == "ddpm_tf":
+            generated_df = _run_ddpm_transformer(
+                train_df=train_df,
+                test_df=test_df,
+                n_samples=args.num_samples,
+                epochs=args.epochs,
+                batch_size=args.batch_size,
+                lr=args.lr,
+                T=args.ddpm_t,
+                lambda_weight=args.ddpm_lambda_weight,
+                lambda_joint=args.ddpm_lambda_joint,
+                seed=args.seed,
+            )
+        elif model_name == "datgan":
+            generated_df = _run_datgan(
+                train_df=train_df,
+                all_columns=ALL_COLUMNS,
+                n_samples=args.num_samples,
+                output_dir=args.datgan_output_dir,
+                epochs=args.epochs,
+                batch_size=args.batch_size,
+            )
+        else:
+            raise ValueError(f"Unsupported model: {model_name}")
+
+        row = _evaluate_and_save(
+            model_name=model_name,
+            generated_df=generated_df,
+            sampled_truth_df=sampled_truth_df,
+            train_real_df=train_df,
+            test_real_df=test_df,
+            output_dir=args.output_dir,
+            seed=args.seed,
+        )
+        rows.append(row)
+        logging.info(
+            "%s done. joint_js=%.6f, LVR=%.4f, TSTR-F1=%.4f (TRTR-F1=%.4f)",
+            row["model"],
+            row["joint_js"],
+            row["logical_validity_rate"],
+            row["tstr_macro_f1"],
+            row["trtr_macro_f1"],
+        )
+
+    _append_summary(args.output_dir, rows)
+    logging.info("All selected baselines completed. Outputs in: %s", args.output_dir)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Train and evaluate tabular baselines: CTGAN / DATGAN / VAE / DDPM-Transformer."
+    )
+    parser.add_argument("--traindata", type=str, default="data/train_data.csv")
+    parser.add_argument("--testdata", type=str, default="data/test_data.csv")
+    parser.add_argument("--output_dir", type=str, default="exp/baseline")
+    parser.add_argument("--datgan_output_dir", type=str, default="exp/baseline/datgan_model")
+    parser.add_argument(
+        "--models",
+        nargs="+",
+        default=["datgan"],
+        choices=["ctgan", "datgan", "vae", "ddpm_tf"],
+        help="Which baselines to run.",
+    )
+    parser.add_argument("--num_samples", type=int, default=10000)
+    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--batch_size", type=int, default=500)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--vae_latent_dim", type=int, default=64)
+    parser.add_argument("--vae_hidden_dim", type=int, default=256)
+    parser.add_argument("--vae_beta_kl", type=float, default=0.01)
+    parser.add_argument("--ddpm_t", type=int, default=100, help="Diffusion steps for ddpm_tf baseline.")
+    parser.add_argument("--ddpm_lambda_weight", type=float, default=1.0)
+    parser.add_argument("--ddpm_lambda_joint", type=float, default=0.0)
+    parser.add_argument("--seed", type=int, default=42)
+    args = parser.parse_args()
+    main(args)

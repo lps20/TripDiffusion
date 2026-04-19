@@ -8,7 +8,7 @@ import os
 import datetime
 import ast
 
-from model.HCD_Net import TripDiffusionModel
+from model.HCD_Net_absorbing import TripDiffusionModel
 import utils.train_utils, utils.test_utils
 
 def main(args):
@@ -75,6 +75,7 @@ def main(args):
 
 
     model = TripDiffusionModel(features_info, cond_info, T, joint_pairs_list).to(device)
+    logging.info("Using absorbing-state mask diffusion for categorical features.")
 
     if args.checkpoint:
         logging.info(f"Loading model checkpoint from {args.checkpoint}")
@@ -163,7 +164,7 @@ def main(args):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train TripDiffusionModel and generate samples.")
+    parser = argparse.ArgumentParser(description="Train absorbing-mask TripDiffusionModel and generate samples.")
     parser.add_argument("--traindata", type=str, default="data/train_data.csv", help="Path to training dataset CSV file")
     parser.add_argument("--testdata", type=str, default="data/test_data.csv", help="Path to testing dataset CSV file")
     parser.add_argument("--patience", type=int, default=10, help="Number of epochs to wait for improvement before early stopping.")

@@ -7,8 +7,12 @@ import logging
 import os
 import datetime
 import ast
+import json
+import time
+import random
+import numpy as np
 
-from model.HCD_Net import TripDiffusionModel
+from model.HCD_Net_v2 import TripDiffusionModel
 import utils.train_utils, utils.test_utils
 
 def main(args):
@@ -23,6 +27,7 @@ def main(args):
     log_file = os.path.join(exp_dir, f"training.log")
     model_file = os.path.join(exp_dir, f"model.pth")
     generation_file = os.path.join(exp_dir, f"generated_samples.csv")
+    metrics_file = args.metrics_file or os.path.join(exp_dir, "generated_samples_metrics.json")
     
     # set logging
     logger = logging.getLogger()
@@ -43,6 +48,13 @@ def main(args):
     logger.addHandler(ch)
 
     logging.info("Command line arguments: %s", vars(args))
+    if args.seed is not None:
+        random.seed(args.seed)
+        np.random.seed(args.seed)
+        torch.manual_seed(args.seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(args.seed)
+        logging.info("Global random seed set to: %d", args.seed)
     
     # Define feature and condition information
     features_info = [
@@ -75,6 +87,7 @@ def main(args):
 
 
     model = TripDiffusionModel(features_info, cond_info, T, joint_pairs_list).to(device)
+    logging.info("Using HCD v2: shared transformer + soft causal adapters.")
 
     if args.checkpoint:
         logging.info(f"Loading model checkpoint from {args.checkpoint}")
@@ -135,12 +148,15 @@ def main(args):
     # Generate samples from the trained model
     test_df = pd.read_csv(args.testdata)
     train_eval_df = pd.read_csv(args.traindata) if args.traindata else None
+    sample_start = time.perf_counter()
     generated_samples, truth_samples = utils.train_utils.sample_trip(
         model, 
         test_df, 
         num_samples=args.num_samples,
         device=device
     )
+    sampling_seconds = float(time.perf_counter() - sample_start)
+    logging.info("Sampling completed in %.4f seconds for %d samples.", sampling_seconds, args.num_samples)
     utils.train_utils.save_generated_samples(generated_samples, output_file = generation_file)
 
 
@@ -158,12 +174,24 @@ def main(args):
     )
     logging.info("Evaluation results on all data: %s", eva_all)
 
+    metrics_payload = {
+        "T": int(T),
+        "num_samples": int(args.num_samples),
+        "sampling_seconds": sampling_seconds,
+        "sampling_seconds_per_10k": float(sampling_seconds * (10000.0 / max(float(args.num_samples), 1.0))),
+        "evaluation": eva_all,
+    }
+    os.makedirs(os.path.dirname(metrics_file) or ".", exist_ok=True)
+    with open(metrics_file, "w", encoding="utf-8") as f:
+        json.dump(metrics_payload, f, ensure_ascii=False, indent=2)
+    logging.info("Saved metrics JSON: %s", metrics_file)
+
     logging.info("Training and evaluation completed. Generated samples saved to %s", generation_file)
     print("Training and evaluation completed. Check logs and saved model in:", exp_dir)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train TripDiffusionModel and generate samples.")
+    parser = argparse.ArgumentParser(description="Train HCD v2 TripDiffusionModel and generate samples.")
     parser.add_argument("--traindata", type=str, default="data/train_data.csv", help="Path to training dataset CSV file")
     parser.add_argument("--testdata", type=str, default="data/test_data.csv", help="Path to testing dataset CSV file")
     parser.add_argument("--patience", type=int, default=10, help="Number of epochs to wait for improvement before early stopping.")
@@ -171,14 +199,14 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=100, help="Number of training epochs")
     parser.add_argument("--batch_size", type=int, default=500, help="Batch size for training")
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
-    parser.add_argument("--lambda_weight", type=float, default=1.0, help="Weight for auxiliary loss")
-    parser.add_argument("--lambda_joint", type=float, default=0.0, help="Weight for joint loss")
+    parser.add_argument("--lambda_weight", type=float, default=2.0, help="Weight for auxiliary loss")
+    parser.add_argument("--lambda_joint", type=float, default=0.5, help="Weight for joint loss")
     parser.add_argument("--T", type=int, default=100, help="Diffusion steps")
     parser.add_argument("--parallel", type=bool, default=True, help="Parallel computing")
     parser.add_argument("--num_samples", type=int, default=10000, help="Number of samples to generate after training")
     parser.add_argument("--exp_dir", type=str, default=None, help="Directory to save logs and models (default: auto timestamp)")
     parser.add_argument("--joint_pairs", type=str, default="[(0,4),(1,5),(2,6),(3,6),(2,3),(6,7)]", help="List of joint feature pairs for joint loss, e.g., [(0,4),(1,5)]")
-    parser.add_argument("--loss_type", type=str, default="causal", help="Type of loss function to use: 'standard' or 'causal'")
+    parser.add_argument("--loss_type", type=str, default="standard", help="Type of loss function to use: 'standard' or 'causal'")
     parser.add_argument("--causal_weight", type=str, default=None, help="Weights for causal loss groups in JSON format, e.g., '{\"st\": 1.0, \"mode\": 1.0}'")
     parser.add_argument("--batch_sampling", type=str, default="sequential", choices=["sequential", "shuffle", "balanced"], help="Batch index sampling strategy")
     parser.add_argument("--sampling_feature", type=str, default="act_num", help="Feature used for balanced batch sampling")
@@ -186,6 +214,8 @@ if __name__ == "__main__":
     parser.add_argument("--t_sampling", type=str, default="uniform", choices=["uniform", "sqrt", "late"], help="Diffusion timestep sampling strategy")
     parser.add_argument("--checkpoint", type=str, default=None, help="Path to pre-trained model.pth")
     parser.add_argument("--eval_only", action="store_true", help="Set this flag to skip training and only evaluate")
+    parser.add_argument("--metrics_file", type=str, default=None, help="Path to write metrics JSON (default: <exp_dir>/generated_samples_metrics.json)")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     
     args = parser.parse_args()
     main(args)

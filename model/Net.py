@@ -182,6 +182,19 @@ class TripDiffusionModel(nn.Module):
             # cum_transitions shape: (T+1, K, K)
             self.register_buffer(f'cum_trans_{name}', torch.stack(cum_trans_list))
 
+            # posterior shape: (T, K, K), compatible with train_utils fast path
+            post_list = []
+            for t in range(1, T + 1):
+                Q_t = trans_list[t - 1]
+                Q_bar_tm1 = cum_trans_list[t - 1]
+                Q_bar_t = cum_trans_list[t]
+                num = Q_bar_tm1.unsqueeze(2) * Q_t.unsqueeze(0)
+                denom = Q_bar_t.unsqueeze(1).clamp(min=1e-12)
+                post_list.append((num / denom).sum(dim=0))
+            post_tensor = torch.stack(post_list, dim=0)
+            self.register_buffer(f'post_{name}', post_tensor, persistent=False)
+            self.posterior[name] = post_tensor
+
     def forward(self, x_t, cond, t):
         """
         Perform a forward pass of the network.

@@ -8,7 +8,7 @@ import os
 import datetime
 import ast
 
-from model.HCD_Net import TripDiffusionModel
+from model.Transformer_Net import TripDiffusionModel
 import utils.train_utils, utils.test_utils
 
 def main(args):
@@ -163,7 +163,7 @@ def main(args):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train TripDiffusionModel and generate samples.")
+    parser = argparse.ArgumentParser(description="Train pure-Transformer TripDiffusionModel and generate samples.")
     parser.add_argument("--traindata", type=str, default="data/train_data.csv", help="Path to training dataset CSV file")
     parser.add_argument("--testdata", type=str, default="data/test_data.csv", help="Path to testing dataset CSV file")
     parser.add_argument("--patience", type=int, default=10, help="Number of epochs to wait for improvement before early stopping.")
@@ -171,14 +171,14 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=100, help="Number of training epochs")
     parser.add_argument("--batch_size", type=int, default=500, help="Batch size for training")
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
-    parser.add_argument("--lambda_weight", type=float, default=1.0, help="Weight for auxiliary loss")
-    parser.add_argument("--lambda_joint", type=float, default=0.0, help="Weight for joint loss")
+    parser.add_argument("--lambda_weight", type=float, default=2.0, help="Weight for auxiliary loss")
+    parser.add_argument("--lambda_joint", type=float, default=0.5, help="Weight for joint loss")
     parser.add_argument("--T", type=int, default=100, help="Diffusion steps")
     parser.add_argument("--parallel", type=bool, default=True, help="Parallel computing")
     parser.add_argument("--num_samples", type=int, default=10000, help="Number of samples to generate after training")
     parser.add_argument("--exp_dir", type=str, default=None, help="Directory to save logs and models (default: auto timestamp)")
     parser.add_argument("--joint_pairs", type=str, default="[(0,4),(1,5),(2,6),(3,6),(2,3),(6,7)]", help="List of joint feature pairs for joint loss, e.g., [(0,4),(1,5)]")
-    parser.add_argument("--loss_type", type=str, default="causal", help="Type of loss function to use: 'standard' or 'causal'")
+    parser.add_argument("--loss_type", type=str, default="standard", help="Type of loss function to use: 'standard' or 'causal'")
     parser.add_argument("--causal_weight", type=str, default=None, help="Weights for causal loss groups in JSON format, e.g., '{\"st\": 1.0, \"mode\": 1.0}'")
     parser.add_argument("--batch_sampling", type=str, default="sequential", choices=["sequential", "shuffle", "balanced"], help="Batch index sampling strategy")
     parser.add_argument("--sampling_feature", type=str, default="act_num", help="Feature used for balanced batch sampling")

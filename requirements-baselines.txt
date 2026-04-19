@@ -1,0 +1,10 @@
+ctgan>=0.10.2
+
+# DATGAN package variants differ across sources.
+# Install the one that supports:
+#   from datgan import DATGAN
+datgan
+
+# DATGAN (tensorflow 2.8) usually needs these compatibility pins:
+# numpy<2
+# protobuf<=3.20.3
