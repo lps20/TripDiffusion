@@ -1,3 +1,14 @@
+import sys
+from pathlib import Path
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from project_paths import setup
+
+setup()
+
 import argparse
 import json
 import logging
@@ -38,7 +49,7 @@ def _configure_plot_style() -> None:
 def _run_single_t(args: argparse.Namespace, t_value: int, run_dir: str, metrics_file: str) -> None:
     cmd = [
         sys.executable,
-        "run_hcd_v2.py",
+        "scripts/train/run_hcd_v2.py",
         "--traindata",
         args.traindata,
         "--testdata",
@@ -79,6 +90,8 @@ def _run_single_t(args: argparse.Namespace, t_value: int, run_dir: str, metrics_
         metrics_file,
         "--seed",
         str(args.seed),
+        "--num_seeds",
+        "1",
     ]
     if args.causal_weight is not None:
         cmd.extend(["--causal_weight", args.causal_weight])
@@ -123,21 +136,14 @@ def _plot_sensitivity(df: pd.DataFrame, out_png: str, out_pdf: str) -> None:
     axes[0].plot(x, y_jsd, marker="o", linewidth=2, color="#1f77b4")
     axes[0].set_xlabel("Diffusion Steps T")
     axes[0].set_ylabel("Joint JSD")
-    axes[0].set_title("JSD Sensitivity to T")
     axes[0].grid(True, linestyle="--", alpha=0.35)
     axes[0].set_xticks(df["T"].tolist())
 
     axes[1].plot(x, y_time, marker="o", linewidth=2, color="#d62728")
     axes[1].set_xlabel("Diffusion Steps T")
     axes[1].set_ylabel("Inference Time (sec / 10k samples)")
-    axes[1].set_title("Sampling Efficiency vs T")
     axes[1].grid(True, linestyle="--", alpha=0.35)
     axes[1].set_xticks(df["T"].tolist())
-
-    for ax, ys in zip(axes, [y_jsd, y_time]):
-        for xv, yv in zip(x, ys):
-            if np.isfinite(yv):
-                ax.annotate(f"{yv:.4f}", (xv, yv), textcoords="offset points", xytext=(0, 6), ha="center", fontsize=8)
 
     fig.savefig(out_png, bbox_inches="tight")
     fig.savefig(out_pdf, bbox_inches="tight")

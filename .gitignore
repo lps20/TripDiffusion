@@ -1,10 +1,29 @@
-# .gitignore
+# Python
 __pycache__/
 *.pyc
+*.pyo
+.venv/
 venv/
-*.log
+
+# Experiments & outputs
 exp/
-*.bat
-*.sh
-*.ipynb
 figs/
+*.log
+
+# Data (large; regenerate via scripts/data/prepare_train_test_split.py)
+/data/
+!data/description.docx
+
+# Third-party / local-only code
+caveat/
+acteval/
+
+# IDE
+.vscode/
+
+# Notebooks
+*.ipynb
+
+# OS
+.DS_Store
+Thumbs.db

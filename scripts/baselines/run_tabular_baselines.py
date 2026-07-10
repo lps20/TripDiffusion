@@ -1,3 +1,14 @@
+import sys
+from pathlib import Path
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from project_paths import setup
+
+setup()
+
 import argparse
 import inspect
 import importlib
@@ -18,6 +29,12 @@ from torch.utils.data import DataLoader, TensorDataset
 
 import utils.test_utils
 import utils.train_utils
+from utils.multi_seed import (
+    add_multiseed_arguments,
+    aggregate_by_model,
+    parse_seeds,
+    save_multiseed_artifacts,
+)
 
 
 TRIP_SCHEMA = [
@@ -44,8 +61,9 @@ FULL_SCHEMA = [
 
 
 def _set_seed(seed: int) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
+    from utils.multi_seed import set_global_seed
+
+    set_global_seed(seed)
 
 
 def _filter_kwargs(fn: Any, kwargs: Dict[str, Any]) -> Dict[str, Any]:
@@ -186,14 +204,14 @@ def _import_datgan_class():
 
 
 def _sanitize_df_by_schema(df: pd.DataFrame, schema: List[Dict[str, Any]]) -> pd.DataFrame:
+    from utils.data_encoding import normalize_category_values
+
     output = df.copy()
     for feat in schema:
         col = feat["name"]
         if col not in output.columns:
             raise ValueError(f"Generated data missing required column: {col}")
-        output[col] = pd.to_numeric(output[col], errors="coerce").fillna(0.0)
-        output[col] = output[col].round().astype(int)
-        output[col] = output[col].clip(lower=0, upper=feat["num_classes"] - 1)
+        output[col] = normalize_category_values(output[col], feat["num_classes"], col)
     return output
 
 
@@ -585,6 +603,7 @@ def _evaluate_and_save(
     test_real_df: pd.DataFrame,
     output_dir: str,
     seed: int,
+    save_outputs: bool = True,
 ) -> Dict[str, Any]:
     generated_df = _sanitize_df_by_schema(generated_df, FULL_SCHEMA)
     sampled_truth_df = _sanitize_df_by_schema(sampled_truth_df, FULL_SCHEMA)
@@ -609,25 +628,20 @@ def _evaluate_and_save(
     metrics = jsd_lvr_tstr_metrics
 
     model_tag = model_name.upper()
-    output_csv = os.path.join(output_dir, f"{model_tag}_gene.csv")
-    generated_df[ALL_COLUMNS].to_csv(output_csv, index=False)
+    if save_outputs:
+        output_csv = os.path.join(output_dir, f"{model_tag}_gene.csv")
+        generated_df[ALL_COLUMNS].to_csv(output_csv, index=False)
 
-    metric_json = os.path.join(output_dir, f"{model_tag}_metrics.json")
-    with open(metric_json, "w", encoding="utf-8") as f:
-        json.dump(metrics, f, ensure_ascii=False, indent=2)
+        metric_json = os.path.join(output_dir, f"{model_tag}_metrics.json")
+        with open(metric_json, "w", encoding="utf-8") as f:
+            json.dump(metrics, f, ensure_ascii=False, indent=2)
 
-    flat_row: Dict[str, Any] = {
-        "model": model_tag,
-        "joint_js": float(metrics["joint_js"]),
-        "logical_validity_rate": float(metrics["logical_validity_rate"]),
-        "tstr_macro_f1": float(metrics["tstr_macro_f1"]),
-        "trtr_macro_f1": float(metrics["trtr_macro_f1"]),
-        "tstr_accuracy": float(metrics["tstr_accuracy"]),
-        "trtr_accuracy": float(metrics["trtr_accuracy"]),
-        "tstr_trtr_f1_ratio": float(metrics["tstr_trtr_f1_ratio"]),
-    }
-    for feat_name, value in metrics["single_feature_jsd"].items():
-        flat_row[f"jsd_{feat_name}"] = float(value)
+    flat_row = utils.test_utils.flatten_evaluation_metrics(
+        model_name=model_tag,
+        metrics=metrics,
+        extra_fields={"seed": seed},
+        include_formatted=True,
+    )
     return flat_row
 
 
@@ -645,8 +659,62 @@ def _append_summary(output_dir: str, rows: List[Dict[str, Any]]) -> None:
         new_df.to_csv(summary_path, index=False)
 
 
+def _run_model_for_seed(
+    model_name: str,
+    args: argparse.Namespace,
+    train_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    sampled_truth_df: pd.DataFrame,
+    seed: int,
+    output_dir: str,
+    save_outputs: bool,
+) -> pd.DataFrame:
+    if model_name == "ctgan":
+        return _run_ctgan(
+            train_df=train_df,
+            all_columns=ALL_COLUMNS,
+            n_samples=args.num_samples,
+            epochs=args.epochs,
+            batch_size=args.batch_size,
+        )
+    if model_name == "vae":
+        return _run_vae(
+            train_df=train_df,
+            n_samples=args.num_samples,
+            epochs=args.epochs,
+            batch_size=args.batch_size,
+            lr=args.lr,
+            latent_dim=args.vae_latent_dim,
+            hidden_dim=args.vae_hidden_dim,
+            beta_kl=args.vae_beta_kl,
+            seed=seed,
+        )
+    if model_name == "ddpm_tf":
+        return _run_ddpm_transformer(
+            train_df=train_df,
+            test_df=test_df,
+            n_samples=args.num_samples,
+            epochs=args.epochs,
+            batch_size=args.batch_size,
+            lr=args.lr,
+            T=args.ddpm_t,
+            lambda_weight=args.ddpm_lambda_weight,
+            lambda_joint=args.ddpm_lambda_joint,
+            seed=seed,
+        )
+    if model_name == "datgan":
+        return _run_datgan(
+            train_df=train_df,
+            all_columns=ALL_COLUMNS,
+            n_samples=args.num_samples,
+            output_dir=args.datgan_output_dir,
+            epochs=args.epochs,
+            batch_size=args.batch_size,
+        )
+    raise ValueError(f"Unsupported model: {model_name}")
+
+
 def main(args: argparse.Namespace) -> None:
-    _set_seed(args.seed)
     os.makedirs(args.output_dir, exist_ok=True)
 
     logging.basicConfig(
@@ -655,6 +723,9 @@ def main(args: argparse.Namespace) -> None:
         datefmt="%Y-%m-%d %H:%M:%S",
     )
     logging.info("Arguments: %s", vars(args))
+
+    seeds = parse_seeds(args.seed, args.seeds, args.num_seeds, args.seed_start)
+    logging.info("Running baselines across seeds: %s", seeds)
 
     train_df = pd.read_csv(args.traindata)
     test_df = pd.read_csv(args.testdata)
@@ -665,80 +736,89 @@ def main(args: argparse.Namespace) -> None:
         if missing:
             raise ValueError(f"{dataset_name} dataset missing columns: {sorted(missing)}")
 
-    sampled_truth_df = test_df.sample(
-        n=args.num_samples,
-        replace=True,
-        random_state=args.seed,
-    ).reset_index(drop=True)
+    per_seed_rows: List[Dict[str, Any]] = []
+    for seed in seeds:
+        _set_seed(seed)
+        sampled_truth_df = test_df.sample(
+            n=args.num_samples,
+            replace=True,
+            random_state=seed,
+        ).reset_index(drop=True)
+        seed_dir = os.path.join(args.output_dir, f"seed_{seed}")
+        os.makedirs(seed_dir, exist_ok=True)
+        save_outputs = len(seeds) == 1
 
-    rows = []
-    for model_name in args.models:
-        logging.info("Running baseline: %s", model_name.upper())
-        if model_name == "ctgan":
-            generated_df = _run_ctgan(
-                train_df=train_df,
-                all_columns=ALL_COLUMNS,
-                n_samples=args.num_samples,
-                epochs=args.epochs,
-                batch_size=args.batch_size,
-            )
-        elif model_name == "vae":
-            generated_df = _run_vae(
-                train_df=train_df,
-                n_samples=args.num_samples,
-                epochs=args.epochs,
-                batch_size=args.batch_size,
-                lr=args.lr,
-                latent_dim=args.vae_latent_dim,
-                hidden_dim=args.vae_hidden_dim,
-                beta_kl=args.vae_beta_kl,
-                seed=args.seed,
-            )
-        elif model_name == "ddpm_tf":
-            generated_df = _run_ddpm_transformer(
+        for model_name in args.models:
+            logging.info("Running baseline %s (seed=%d)", model_name.upper(), seed)
+            generated_df = _run_model_for_seed(
+                model_name=model_name,
+                args=args,
                 train_df=train_df,
                 test_df=test_df,
-                n_samples=args.num_samples,
-                epochs=args.epochs,
-                batch_size=args.batch_size,
-                lr=args.lr,
-                T=args.ddpm_t,
-                lambda_weight=args.ddpm_lambda_weight,
-                lambda_joint=args.ddpm_lambda_joint,
-                seed=args.seed,
+                sampled_truth_df=sampled_truth_df,
+                seed=seed,
+                output_dir=seed_dir if not save_outputs else args.output_dir,
+                save_outputs=save_outputs,
             )
-        elif model_name == "datgan":
-            generated_df = _run_datgan(
-                train_df=train_df,
-                all_columns=ALL_COLUMNS,
-                n_samples=args.num_samples,
-                output_dir=args.datgan_output_dir,
-                epochs=args.epochs,
-                batch_size=args.batch_size,
+            row = _evaluate_and_save(
+                model_name=model_name,
+                generated_df=generated_df,
+                sampled_truth_df=sampled_truth_df,
+                train_real_df=train_df,
+                test_real_df=test_df,
+                output_dir=seed_dir if not save_outputs else args.output_dir,
+                seed=seed,
+                save_outputs=save_outputs,
             )
-        else:
-            raise ValueError(f"Unsupported model: {model_name}")
+            per_seed_rows.append(row)
+            logging.info(
+                "%s seed=%d | joint_js=%.6f | marginal_jsd=%.6f | LVR=%.4f | MNL sim=%.4f",
+                row["model"],
+                seed,
+                row.get("joint_js", float("nan")),
+                row.get("mean_marginal_jsd", float("nan")),
+                row.get("logical_validity_rate", float("nan")),
+                row.get("mnl_behavioral_similarity", float("nan")),
+            )
 
-        row = _evaluate_and_save(
-            model_name=model_name,
-            generated_df=generated_df,
-            sampled_truth_df=sampled_truth_df,
-            train_real_df=train_df,
-            test_real_df=test_df,
-            output_dir=args.output_dir,
-            seed=args.seed,
-        )
-        rows.append(row)
-        logging.info(
-            "%s done. joint_js=%.6f, LVR=%.4f, TSTR-F1=%.4f (TRTR-F1=%.4f)",
-            row["model"],
-            row["joint_js"],
-            row["logical_validity_rate"],
-            row["tstr_macro_f1"],
-            row["trtr_macro_f1"],
-        )
+    per_seed_path = os.path.join(args.output_dir, "baseline_metrics_per_seed.csv")
+    pd.DataFrame(per_seed_rows).to_csv(per_seed_path, index=False)
 
-    _append_summary(args.output_dir, rows)
+    if len(seeds) > 1:
+        summary_rows = aggregate_by_model(per_seed_rows, model_key="model")
+        summary_path = os.path.join(args.output_dir, "baseline_metrics_summary.csv")
+        pd.DataFrame(summary_rows).to_csv(summary_path, index=False)
+        save_multiseed_artifacts(
+            args.output_dir,
+            [
+                {
+                    "model": row["model"],
+                    "seed": row["seed"],
+                    "joint_js": row.get("joint_js"),
+                    "mean_marginal_jsd": row.get("mean_marginal_jsd"),
+                    "logical_validity_rate": row.get("logical_validity_rate"),
+                    "mnl_behavioral_similarity": row.get("mnl_behavioral_similarity"),
+                    "tstr_trtr_f1_ratio": row.get("mnl_behavioral_similarity"),
+                }
+                for row in per_seed_rows
+            ],
+            summary_rows=summary_rows,
+            basename="baseline_multiseed",
+        )
+        logging.info("Multi-seed baseline summary:")
+        for summary_row in summary_rows:
+            logging.info(
+                "%s | joint_js=%s | marginal_jsd=%s | LVR=%s | MNL sim=%s",
+                summary_row["model"],
+                summary_row.get("joint_js"),
+                summary_row.get("mean_marginal_jsd"),
+                summary_row.get("logical_validity_rate"),
+                summary_row.get("mnl_behavioral_similarity"),
+            )
+        _append_summary(args.output_dir, summary_rows)
+    else:
+        _append_summary(args.output_dir, per_seed_rows)
+
     logging.info("All selected baselines completed. Outputs in: %s", args.output_dir)
 
 
@@ -764,9 +844,9 @@ if __name__ == "__main__":
     parser.add_argument("--vae_latent_dim", type=int, default=64)
     parser.add_argument("--vae_hidden_dim", type=int, default=256)
     parser.add_argument("--vae_beta_kl", type=float, default=0.01)
-    parser.add_argument("--ddpm_t", type=int, default=100, help="Diffusion steps for ddpm_tf baseline.")
+    parser.add_argument("--ddpm_t", type=int, default=10, help="Diffusion steps for ddpm_tf baseline.")
     parser.add_argument("--ddpm_lambda_weight", type=float, default=1.0)
     parser.add_argument("--ddpm_lambda_joint", type=float, default=0.0)
-    parser.add_argument("--seed", type=int, default=42)
+    add_multiseed_arguments(parser, default_num_seeds=5)
     args = parser.parse_args()
     main(args)

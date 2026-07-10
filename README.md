@@ -6,22 +6,43 @@ A diffusion-based discrete generative model for synthetic trip generation.
 
 ## Environment Setup
 
-### Install Required Packages
-
 ```bash
 pip install -r requirements.txt
 ```
 
-Or, if you use conda, see Conda Setup.
-
-## Running the Model
-Single Run (default settings)
+Or with conda:
 
 ```bash
-python run.py --traindata data/train_data.csv --testdata data/test_data.csv
+conda env create -f environment.yml
+conda activate tripdiffusion
 ```
 
-## Baselines: CTGAN / DATGAN
+---
+
+## Running the Model
+
+Single run (default settings):
+
+```bash
+python scripts/train/run.py --traindata data/train_data.csv --testdata data/test_data.csv
+```
+
+HCD v2 model with multi-seed support:
+
+```bash
+python scripts/train/run_hcd_v2.py --traindata data/train_data.csv --testdata data/test_data.csv --num_seeds 3
+```
+
+Other diffusion variants:
+
+```bash
+python scripts/train/run_transformer.py
+python scripts/train/run_absorbing.py
+```
+
+---
+
+## Baselines: CTGAN / DATGAN / VAE
 
 Install optional baseline dependencies:
 
@@ -32,78 +53,84 @@ pip install -r requirements-baselines.txt
 Run baseline generation and evaluation:
 
 ```bash
-python run_tabular_baselines.py --models ctgan datgan --traindata data/train_data.csv --testdata data/test_data.csv --num_samples 10000
+python scripts/baselines/run_tabular_baselines.py --models ctgan datgan --traindata data/train_data.csv --testdata data/test_data.csv --num_samples 10000
 ```
 
-Outputs are saved to `exp/baseline/`:
-- `CTGAN_gene.csv`
-- `DATGAN_gene.csv`
-- `CTGAN_metrics.json`
-- `DATGAN_metrics.json`
-- `baseline_metrics.csv`
+Outputs are saved to `exp/baseline/`.
 
-### Parameters you can modify:
+---
+
+## Evaluation & Plotting
+
+Evaluate a generated CSV:
+
+```bash
+python scripts/eval/evaluate_generated_csv.py --generated_csv exp/baseline/CTGAN_gene.csv --train_data data/train_data.csv --test_data data/test_data.csv
+```
+
+Plot marginal / joint distributions:
+
+```bash
+python scripts/plot/plot_marginal_distributions.py
+python scripts/plot/plot_age_gender_joint_comparison.py
+```
+
+---
+
+## Data Preparation
+
+Regenerate train/test split (80:20 by ID):
+
+```bash
+python scripts/data/prepare_train_test_split.py
+```
+
+---
+
+## Batch Experiments
+
+Parameter sweeps live under `batch/`:
+
+```bash
+batch\run_epoch_batch.bat
+batch\run_T.bat
+batch\run_lambda.bat
+batch\run_lr.bat
+batch\run_joint.bat
+```
+
+Each run saves `model.pth`, `training.log`, and `generated_samples.csv` under `exp/<experiment_name>/`.
+
+---
+
+## Common Parameters
 
 - `--epochs` (default: 100)
 - `--batch_size` (default: 64)
 - `--lr` (default: 1e-3)
 - `--lambda_weight` (default: 1.0)
-- `--T` (diffusion steps, default: 100)
+- `--T` (diffusion steps, default: 10)
 - `--num_samples` (per-cluster generation, default: 100)
-- `--exp_dir` (optional: custom folder to save model/logs)
+- `--exp_dir` (optional custom output folder)
 
 ---
 
-##  Batch Experiments (Windows)
-
-You can test different parameter combinations using `.bat` scripts:
-
-```bash
-run_epochs_batch.bat     # (Peisen) Test various epochs & batch sizes
-run_T.bat                # (Churong) Test different diffusion step T values
-run_lambda.bat           # (Ivan) Test different lambda weights
-run_lr.bat               # (Yingnan) Test different learning rates
-```
-
-Each run will output:
-- `model.pth`: Trained model
-- `training.log`: Log file
-- `generated_samples.csv`: Generated trip samples
-Under:
-```bash
-exp/<experiment_name>/
-```
-
----
-
-## 💡 Conda Setup
-
-If you prefer using Conda:
-
-```bash
-conda env create -f environment.yml
-conda activate tripdiffusion
-```
-
----
-
-##  Project Structure
+## Project Structure
 
 ```
 project/
-├── data/
-│   ├── train_data.csv
-│   ├── test_data.csv
-├── run.py
-├── train_utils.py
-├── test_utils.py
-├── Net.py
+├── batch/                  # Windows/Linux batch sweep scripts
+├── data/                   # train/test CSVs (gitignored; regenerate locally)
+├── model/                  # network definitions
+├── scripts/
+│   ├── baselines/          # CTGAN, DATGAN, VAE runners
+│   ├── data/               # data preparation
+│   ├── eval/               # standalone evaluation
+│   ├── experiments/        # sensitivity / robustness sweeps
+│   ├── plot/               # figure generation
+│   └── train/              # diffusion training entry points
+├── utils/                  # training, evaluation, metrics
+├── exp/                    # experiment outputs (gitignored)
 ├── requirements.txt
-├── environment.yml
-├── run_epochs_batch.bat
-├── run_T.bat
-├── run_lambda.bat
-├── run_lr.bat
-└── exp/
+└── environment.yml
 ```
-

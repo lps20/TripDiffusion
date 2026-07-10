@@ -1,3 +1,14 @@
+import sys
+from pathlib import Path
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from project_paths import setup
+
+setup()
+
 import argparse
 import json
 import logging
@@ -32,27 +43,12 @@ def _default_cond_info() -> List[Dict[str, Any]]:
 
 
 def _flatten_metrics(model_name: str, metrics: Dict[str, Any], generated_csv: str) -> Dict[str, Any]:
-    row: Dict[str, Any] = {
-        "model": model_name,
-        "generated_csv": generated_csv,
-        "joint_js": metrics.get("joint_js"),
-        "logical_validity_rate": metrics.get("logical_validity_rate"),
-        "tstr_macro_f1": metrics.get("tstr_macro_f1"),
-        "trtr_macro_f1": metrics.get("trtr_macro_f1"),
-        "tstr_accuracy": metrics.get("tstr_accuracy"),
-        "trtr_accuracy": metrics.get("trtr_accuracy"),
-        "tstr_trtr_f1_ratio": metrics.get("tstr_trtr_f1_ratio"),
-    }
-
-    for feat, value in metrics.get("single_feature_jsd", {}).items():
-        row[f"jsd_{feat}"] = value
-
-    for rule, value in metrics.get("invalid_rule_breakdown", {}).items():
-        row[f"lvr_{rule}"] = value
-
-    row["n_total"] = metrics.get("n_total")
-    row["n_valid"] = metrics.get("n_valid")
-    row["n_invalid"] = metrics.get("n_invalid")
+    row = utils.test_utils.flatten_evaluation_metrics(
+        model_name=model_name,
+        metrics=metrics,
+        extra_fields={"generated_csv": generated_csv},
+        include_formatted=True,
+    )
     return row
 
 
@@ -128,11 +124,13 @@ def main(args: argparse.Namespace) -> None:
         logging.info("Updated summary CSV: %s", args.summary_csv)
 
     logging.info(
-        "Done. joint_js=%s, LVR=%s, TSTR_F1=%s, TRTR_F1=%s",
+        "Done. joint_js=%s, mean_jsd_norm=%s, mean_ordinal_emd=%s, LVR=%s, MNL sim=%s, logloss ratio=%s",
         metrics.get("joint_js"),
+        metrics.get("mean_single_feature_jsd_normalized"),
+        metrics.get("mean_ordinal_emd"),
         metrics.get("logical_validity_rate"),
-        metrics.get("tstr_macro_f1"),
-        metrics.get("trtr_macro_f1"),
+        metrics.get("mnl_behavioral_similarity"),
+        metrics.get("mnl_test_logloss_ratio"),
     )
 
 

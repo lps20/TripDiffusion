@@ -1,7 +1,7 @@
 import numpy as np
 import pandas as pd
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import accuracy_score, f1_score
+
+from utils.mnl_mode_choice import evaluate_mnl_mode_choice_validation
 
 def compute_kl_divergence(p, q, eps=1e-10):
     """
@@ -148,6 +148,188 @@ def evaluate_total_variation_distance(truth_trips, generated_trips):
         total_diff += abs(p - q)
     return 0.5 * total_diff
 
+def compute_emd_ordinal(p, q):
+    """Earth Mover Distance (Wasserstein-1) for ordinal variables."""
+    p = np.array(p, dtype=np.float64)
+    q = np.array(q, dtype=np.float64)
+    if p.sum() == 0 or q.sum() == 0:
+        return 0.0
+    p = p / p.sum()
+    q = q / q.sum()
+    return float(np.sum(np.abs(np.cumsum(p) - np.cumsum(q))))
+
+
+def normalize_jsd_entropy(jsd, num_classes):
+    """Entropy-normalized JSD: JSD / log(K), comparable across cardinalities."""
+    if num_classes <= 1:
+        return 0.0
+    denom = float(np.log(num_classes))
+    return float(jsd / denom) if denom > 0 else 0.0
+
+
+def normalize_jsd_vs_uniform(jsd, truth_trips, feature_index, num_classes):
+    """
+    Min-max style normalization against a naive uniform baseline and ideal JSD=0:
+      JSD_norm = JSD(truth, gen) / JSD(truth, uniform)
+    """
+    p = get_feature_distribution(truth_trips, feature_index, num_classes)
+    uniform = np.ones(num_classes, dtype=np.float64) / num_classes
+    jsd_uniform = compute_js_divergence(p, uniform)
+    if jsd_uniform <= 1e-12:
+        return 0.0
+    return float(jsd / jsd_uniform)
+
+
+def evaluate_single_feature_emd(truth_trips, generated_trips, feature_index, num_classes):
+    """Compute EMD between ground truth and generated data for one ordinal feature."""
+    p = get_feature_distribution(truth_trips, feature_index, num_classes)
+    q = get_feature_distribution(generated_trips, feature_index, num_classes)
+    return compute_emd_ordinal(p, q)
+
+
+def evaluate_all_ordinal_features_emd(truth_trips, generated_trips, features_info):
+    """Compute EMD for all ordinal features."""
+    emds = {}
+    for idx, feat in enumerate(features_info):
+        if feat.get("type") != "ordinal":
+            continue
+        name = feat["name"]
+        num_classes = feat["num_classes"]
+        emds[name] = evaluate_single_feature_emd(truth_trips, generated_trips, idx, num_classes)
+    return emds
+
+
+def evaluate_all_features_jsd_normalized(truth_trips, generated_trips, features_info):
+    """Return entropy-normalized and uniform-baseline-normalized JSD per feature."""
+    entropy_norm = {}
+    uniform_norm = {}
+    for idx, feat in enumerate(features_info):
+        name = feat["name"]
+        num_classes = feat["num_classes"]
+        jsd = evaluate_single_feature_jsd(truth_trips, generated_trips, idx, num_classes)
+        entropy_norm[name] = normalize_jsd_entropy(jsd, num_classes)
+        uniform_norm[name] = normalize_jsd_vs_uniform(jsd, truth_trips, idx, num_classes)
+    return entropy_norm, uniform_norm
+
+
+def format_metric_cell(value, sci_threshold_low=1e-2, sci_threshold_high=1e2):
+    """
+    Uniform numeric formatting for comparison tables (e.g., Table 3).
+
+    Uses fixed decimal precision by default; switches to scientific notation
+    only when magnitude is very small or very large, with one consistent rule.
+    """
+    if value is None:
+        return "—"
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    if np.isnan(v):
+        return "—"
+    if v == 0.0:
+        return "0.0000"
+    av = abs(v)
+    if av < sci_threshold_low or av >= sci_threshold_high:
+        return f"{v:.2e}"
+    return f"{v:.4f}"
+
+
+def format_metrics_table_row(metrics, prefix_map=None):
+    """
+    Format one metrics dict into display strings for tabular export.
+
+    prefix_map: optional {metric_key: output_prefix} for nested dict fields.
+    """
+    formatted = {}
+    scalar_keys = [
+        "joint_js",
+        "joint_js_normalized",
+        "mean_marginal_jsd",
+        "mean_single_feature_jsd_normalized",
+        "mean_ordinal_emd",
+        "logical_validity_rate",
+        "mnl_behavioral_similarity",
+        "mnl_coef_cosine_similarity",
+        "mnl_ame_cosine_similarity",
+        "mnl_elasticity_cosine_similarity",
+        "mnl_test_logloss_ratio",
+        "tstr_trtr_f1_ratio",
+    ]
+    for key in scalar_keys:
+        if key in metrics:
+            formatted[key] = format_metric_cell(metrics[key])
+
+    nested_specs = [
+        ("single_feature_jsd", "jsd"),
+        ("single_feature_jsd_normalized", "jsd_norm"),
+        ("single_feature_jsd_vs_uniform", "jsd_uni"),
+        ("single_feature_emd", "emd"),
+    ]
+    for metric_key, default_prefix in nested_specs:
+        nested = metrics.get(metric_key)
+        if not isinstance(nested, dict):
+            continue
+        prefix = (prefix_map or {}).get(metric_key, default_prefix)
+        for feat_name, value in nested.items():
+            formatted[f"{prefix}_{feat_name}"] = format_metric_cell(value)
+
+    return formatted
+
+
+def flatten_evaluation_metrics(
+    model_name,
+    metrics,
+    extra_fields=None,
+    include_formatted=False,
+):
+    """Flatten nested evaluation metrics into one CSV-friendly row."""
+    row = {"model": model_name}
+    if extra_fields:
+        row.update(extra_fields)
+
+    scalar_keys = [
+        "joint_js",
+        "joint_js_normalized",
+        "mean_marginal_jsd",
+        "mean_single_feature_jsd_normalized",
+        "mean_ordinal_emd",
+        "logical_validity_rate",
+        "mnl_behavioral_similarity",
+        "mnl_coef_cosine_similarity",
+        "mnl_ame_cosine_similarity",
+        "mnl_elasticity_cosine_similarity",
+        "mnl_test_logloss_ratio",
+        "tstr_trtr_f1_ratio",
+    ]
+    for key in scalar_keys:
+        if key in metrics and metrics[key] is not None:
+            row[key] = float(metrics[key])
+
+    for feat_name, value in metrics.get("single_feature_jsd", {}).items():
+        row[f"jsd_{feat_name}"] = float(value)
+    for feat_name, value in metrics.get("single_feature_jsd_normalized", {}).items():
+        row[f"jsd_norm_{feat_name}"] = float(value)
+    for feat_name, value in metrics.get("single_feature_jsd_vs_uniform", {}).items():
+        row[f"jsd_uni_{feat_name}"] = float(value)
+    for feat_name, value in metrics.get("single_feature_emd", {}).items():
+        row[f"emd_{feat_name}"] = float(value)
+
+    for rule, value in metrics.get("invalid_rule_breakdown", {}).items():
+        row[f"lvr_{rule}"] = value
+
+    for count_key in ("n_total", "n_valid", "n_invalid"):
+        if count_key in metrics:
+            row[count_key] = metrics[count_key]
+
+    if include_formatted:
+        formatted = format_metrics_table_row(metrics)
+        for key, value in formatted.items():
+            row[f"fmt_{key}"] = value
+
+    return row
+
+
 def evaluate_single_feature_jsd(truth_trips, generated_trips, feature_index, num_classes):
     """
     Compute JSD between ground truth and generated data for a single feature.
@@ -155,6 +337,7 @@ def evaluate_single_feature_jsd(truth_trips, generated_trips, feature_index, num
     p = get_feature_distribution(truth_trips, feature_index, num_classes)
     q = get_feature_distribution(generated_trips, feature_index, num_classes)
     return compute_js_divergence(p, q)
+
 
 def evaluate_all_features_jsd(truth_trips, generated_trips, features_info):
     """
@@ -282,78 +465,19 @@ def evaluate_tstr_predictive_accuracy(
     random_state=42
 ):
     """
-    TSTR/TRTR utility evaluation:
-      target: mode_num
-      model: RandomForest
-      metrics: macro F1 and accuracy
+    Behavioral TSTR validation via a simple MNL mode-choice model.
+
+    Estimates multinomial logit on synthetic vs. real travel-mode choices and
+    compares utility parameters, average marginal effects, and implied
+    elasticities on held-out real trips.
     """
-    target_col = "mode_num"
-    all_cols = [c["name"] for c in cond_info] + [f["name"] for f in features_info]
-
-    if synthetic_df is None or train_real_df is None or test_real_df is None:
-        return {
-            "tstr_macro_f1": None,
-            "trtr_macro_f1": None,
-            "tstr_accuracy": None,
-            "trtr_accuracy": None,
-            "tstr_trtr_f1_ratio": None
-        }
-
-    required = set(all_cols)
-    if not required.issubset(set(synthetic_df.columns)):
-        return {
-            "tstr_macro_f1": None,
-            "trtr_macro_f1": None,
-            "tstr_accuracy": None,
-            "trtr_accuracy": None,
-            "tstr_trtr_f1_ratio": None
-        }
-    if not required.issubset(set(train_real_df.columns)) or not required.issubset(set(test_real_df.columns)):
-        return {
-            "tstr_macro_f1": None,
-            "trtr_macro_f1": None,
-            "tstr_accuracy": None,
-            "trtr_accuracy": None,
-            "tstr_trtr_f1_ratio": None
-        }
-
-    feature_cols = [c for c in all_cols if c != target_col]
-
-    syn = _sanitize_int_columns(synthetic_df, all_cols)
-    tr = _sanitize_int_columns(train_real_df, all_cols)
-    te = _sanitize_int_columns(test_real_df, all_cols)
-
-    X_syn, y_syn = syn[feature_cols], syn[target_col]
-    X_tr, y_tr = tr[feature_cols], tr[target_col]
-    X_te, y_te = te[feature_cols], te[target_col]
-
-    rf_kwargs = {
-        "n_estimators": 200,
-        "random_state": random_state,
-        "n_jobs": 1,
-        "class_weight": "balanced_subsample"
-    }
-
-    clf_tstr = RandomForestClassifier(**rf_kwargs)
-    clf_tstr.fit(X_syn, y_syn)
-    pred_tstr = clf_tstr.predict(X_te)
-
-    clf_trtr = RandomForestClassifier(**rf_kwargs)
-    clf_trtr.fit(X_tr, y_tr)
-    pred_trtr = clf_trtr.predict(X_te)
-
-    tstr_f1 = float(f1_score(y_te, pred_tstr, average="macro"))
-    trtr_f1 = float(f1_score(y_te, pred_trtr, average="macro"))
-    tstr_acc = float(accuracy_score(y_te, pred_tstr))
-    trtr_acc = float(accuracy_score(y_te, pred_trtr))
-
-    return {
-        "tstr_macro_f1": tstr_f1,
-        "trtr_macro_f1": trtr_f1,
-        "tstr_accuracy": tstr_acc,
-        "trtr_accuracy": trtr_acc,
-        "tstr_trtr_f1_ratio": float(tstr_f1 / max(trtr_f1, 1e-12))
-    }
+    del cond_info, features_info
+    return evaluate_mnl_mode_choice_validation(
+        synthetic_df=synthetic_df,
+        train_real_df=train_real_df,
+        test_real_df=test_real_df,
+        random_state=random_state,
+    )
 
 def evaluate_generated_trips(
     truth_trips,
@@ -367,37 +491,41 @@ def evaluate_generated_trips(
     random_state=42
 ):
     """
-    Evaluate generated trip data by computing JSD metrics (aligned with the paper).
-    
+    Evaluate generated trip data.
+
     Metrics:
-      1. JSD for individual features (Single JSD)
-      2. JSD for joint distribution (Joint JSD)
-
-    Parameters:
-      truth_trips: List of ground truth trip data
-      generated_trips: List of generated trip data
-      features_info: List of feature config dictionaries
-
-    Returns:
-      A dictionary containing values for JSD metrics.
+      1. Raw JSD for individual features and joint distribution
+      2. Entropy-normalized JSD (JSD / log K) and uniform-baseline-normalized JSD
+      3. Earth Mover's Distance (EMD) for ordinal features
+      4. Logical Validity Rate (LVR) and MNL mode-choice behavioral TSTR
     """
-    # 1. JSD for individual features (替代原来的 Single KL)
     single_feature_jsd = evaluate_all_features_jsd(truth_trips, generated_trips, features_info)
-    
-    # 2. Jensen-Shannon Divergence for joint distribution (Joint JSD)
+    single_feature_jsd_normalized, single_feature_jsd_vs_uniform = evaluate_all_features_jsd_normalized(
+        truth_trips, generated_trips, features_info
+    )
+    single_feature_emd = evaluate_all_ordinal_features_emd(truth_trips, generated_trips, features_info)
+
     joint_js = evaluate_joint_js_divergence(truth_trips, generated_trips)
-    
-    # 如果你还需要 TVD 或 Joint KL 作为参考，可以保留，但根据你的要求，这里只返回 JSD
-    # joint_kl = evaluate_joint_kl(truth_trips, generated_trips)
-    # tvd = evaluate_total_variation_distance(truth_trips, generated_trips)
-    
+    joint_js_normalized = float(joint_js / np.log(2.0)) if joint_js is not None else None
+
     results = {
         "single_feature_jsd": single_feature_jsd,
-        "joint_js": joint_js
+        "single_feature_jsd_normalized": single_feature_jsd_normalized,
+        "single_feature_jsd_vs_uniform": single_feature_jsd_vs_uniform,
+        "single_feature_emd": single_feature_emd,
+        "joint_js": joint_js,
+        "joint_js_normalized": joint_js_normalized,
     }
 
-    # LVR and TSTR require condition + trip columns.
-    # Priority: explicit generated_df; fallback to generated_samples list.
+    if single_feature_jsd_normalized:
+        results["mean_single_feature_jsd_normalized"] = float(
+            np.mean(list(single_feature_jsd_normalized.values()))
+        )
+    if single_feature_jsd:
+        results["mean_marginal_jsd"] = float(np.mean(list(single_feature_jsd.values())))
+    if single_feature_emd:
+        results["mean_ordinal_emd"] = float(np.mean(list(single_feature_emd.values())))
+
     if generated_df is None:
         generated_df = _build_samples_dataframe(generated_samples, cond_info, features_info)
 

@@ -220,6 +220,26 @@ class TripDiffusionModel(nn.Module):
     def get_posterior(self, name):
         return getattr(self, f"post_{name}")
 
+    def get_gate_values(self):
+        """Return learned gate parameters for each causal adapter layer."""
+        gates = []
+        for layer_idx, block in enumerate(self.causal_adapters):
+            gate_act = block.gate_act.detach().cpu()
+            gate_st = block.gate_st.detach().cpu()
+            gate_mode = block.gate_mode.detach().cpu()
+            gates.append(
+                {
+                    "layer": layer_idx,
+                    "gate_act_raw": float(gate_act),
+                    "gate_st_raw": float(gate_st),
+                    "gate_mode_raw": float(gate_mode),
+                    "alpha_act": float(torch.sigmoid(gate_act)),
+                    "alpha_st": float(torch.sigmoid(gate_st)),
+                    "alpha_mode": float(torch.sigmoid(gate_mode)),
+                }
+            )
+        return gates
+
     def forward(self, x_t, cond, t):
         feat_tokens = []
         for name in self.feat_names:

@@ -2,8 +2,11 @@ import ast
 import torch
 import torch.nn.functional as F
 import pandas as pd
+import numpy as np
 import logging
 from tqdm import tqdm
+
+from utils.data_encoding import normalize_category_values
 
 def generate_synthetic_trips(num_samples):
     """
@@ -39,14 +42,22 @@ def load_data(file_path, features_info, cond_info):
     df = pd.read_csv(file_path)
     data_features = [feat["name"] for feat in features_info]
     data_cond = [cond["name"] for cond in cond_info]
-    data = []
 
-    for _, row in df.iterrows():
-        x0 = torch.tensor([row[feature] for feature in data_features], dtype=torch.long).flatten()
-        cond = torch.tensor([row[feature] for feature in data_cond], dtype=torch.long).flatten()
-        data.append((x0, cond))
+    for feat in features_info:
+        df[feat["name"]] = normalize_category_values(
+            df[feat["name"]], feat["num_classes"], feat["name"]
+        )
+    for cond in cond_info:
+        df[cond["name"]] = normalize_category_values(
+            df[cond["name"]], cond["num_classes"], cond["name"]
+        )
 
-    return data
+    feature_arr = df[data_features].to_numpy(dtype=np.int64)
+    cond_arr = df[data_cond].to_numpy(dtype=np.int64)
+    return [
+        (torch.tensor(feature_arr[i], dtype=torch.long), torch.tensor(cond_arr[i], dtype=torch.long))
+        for i in range(len(df))
+    ]
 
 
 def _resolve_causal_weights(causal_weight):

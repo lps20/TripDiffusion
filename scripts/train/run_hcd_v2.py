@@ -1,3 +1,14 @@
+import sys
+from pathlib import Path
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from project_paths import setup
+
+setup()
+
 import argparse
 import pandas as pd
 import torch
@@ -9,55 +20,46 @@ import datetime
 import ast
 import json
 import time
-import random
-import numpy as np
+import copy
 
 from model.HCD_Net_v2 import TripDiffusionModel
 import utils.train_utils, utils.test_utils
+from utils.multi_seed import (
+    add_multiseed_arguments,
+    parse_seeds,
+    run_multiseed,
+    set_global_seed,
+)
 
-def main(args):
-    if args.exp_dir is not None:
-        exp_dir = args.exp_dir
-    else:
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        exp_dir = os.path.join("exp", datetime.datetime.now().strftime("%Y%m%d"), f"{timestamp}")
 
-    os.makedirs(exp_dir, exist_ok=True)
+def _unwrap_model(model):
+    return model.module if isinstance(model, nn.DataParallel) else model
 
-    log_file = os.path.join(exp_dir, f"training.log")
-    model_file = os.path.join(exp_dir, f"model.pth")
-    generation_file = os.path.join(exp_dir, f"generated_samples.csv")
-    metrics_file = args.metrics_file or os.path.join(exp_dir, "generated_samples_metrics.json")
-    
-    # set logging
-    logger = logging.getLogger()
-    logger.setLevel(logging.INFO)
-    if logger.hasHandlers():
-        logger.handlers.clear()
 
-    # Add FileHandler
-    fh = logging.FileHandler(log_file, mode='w')
-    fh.setLevel(logging.INFO)
-    formatter = logging.Formatter('%(asctime)s %(levelname)s: %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
-    fh.setFormatter(formatter)
-    logger.addHandler(fh)
-    # Add StreamHandler
-    ch = logging.StreamHandler()
-    ch.setLevel(logging.INFO)
-    ch.setFormatter(formatter)
-    logger.addHandler(ch)
+def _report_gate_values(model):
+    base_model = _unwrap_model(model)
+    if not hasattr(base_model, "get_gate_values"):
+        logging.warning("Model does not expose gate values; skipping gate report.")
+        return None
 
-    logging.info("Command line arguments: %s", vars(args))
-    if args.seed is not None:
-        random.seed(args.seed)
-        np.random.seed(args.seed)
-        torch.manual_seed(args.seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(args.seed)
-        logging.info("Global random seed set to: %d", args.seed)
-    
-    # Define feature and condition information
-    features_info = [
+    gate_values = base_model.get_gate_values()
+    logging.info("Learned gate values (alpha = sigmoid(raw), blend strength per stream):")
+    for gate in gate_values:
+        logging.info(
+            "  Layer %d | act: alpha=%.4f (raw=%.4f) | st: alpha=%.4f (raw=%.4f) | mode: alpha=%.4f (raw=%.4f)",
+            gate["layer"],
+            gate["alpha_act"],
+            gate["gate_act_raw"],
+            gate["alpha_st"],
+            gate["gate_st_raw"],
+            gate["alpha_mode"],
+            gate["gate_mode_raw"],
+        )
+    return gate_values
+
+
+def _default_features_info():
+    return [
         {"name": "start_type", "type": "categorical", "num_classes": 5},
         {"name": "start_zcode_num", "type": "categorical", "num_classes": 77},
         {"name": "act_num", "type": "categorical", "num_classes": 9},
@@ -65,70 +67,101 @@ def main(args):
         {"name": "end_type", "type": "categorical", "num_classes": 5},
         {"name": "end_zcode_num", "type": "categorical", "num_classes": 77},
         {"name": "start_time_num_6", "type": "ordinal", "num_classes": 241},
-        {"name": "trip_time_num_6", "type": "ordinal", "num_classes": 241}
+        {"name": "trip_time_num_6", "type": "ordinal", "num_classes": 241},
     ]
-    cond_info = [
+
+
+def _default_cond_info():
+    return [
         {"name": "relation", "num_classes": 5},
         {"name": "sex", "num_classes": 2},
         {"name": "age_code", "num_classes": 13},
-        {"name": "job_type", "num_classes": 9}
+        {"name": "job_type", "num_classes": 9},
     ]
+
+
+def _configure_logging(exp_dir):
+    log_file = os.path.join(exp_dir, "training.log")
+    logger = logging.getLogger()
+    logger.setLevel(logging.INFO)
+    if logger.hasHandlers():
+        logger.handlers.clear()
+
+    formatter = logging.Formatter("%(asctime)s %(levelname)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+    fh = logging.FileHandler(log_file, mode="w")
+    fh.setLevel(logging.INFO)
+    fh.setFormatter(formatter)
+    logger.addHandler(fh)
+
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.INFO)
+    ch.setFormatter(formatter)
+    logger.addHandler(ch)
+    return log_file
+
+
+def run_once(args, seed, exp_dir):
+    os.makedirs(exp_dir, exist_ok=True)
+    _configure_logging(exp_dir)
+
+    model_file = os.path.join(exp_dir, "model.pth")
+    generation_file = os.path.join(exp_dir, "generated_samples.csv")
+    metrics_file = args.metrics_file or os.path.join(exp_dir, "generated_samples_metrics.json")
+
+    logging.info("Command line arguments: %s", vars(args))
+    set_global_seed(seed)
+    logging.info("Global random seed set to: %d", seed)
+
+    features_info = _default_features_info()
+    cond_info = _default_cond_info()
 
     try:
         joint_pairs_list = ast.literal_eval(args.joint_pairs)
-        print(f"Joint pairs loaded: {joint_pairs_list}") # 调试打印，确认格式正确
+        print(f"Joint pairs loaded: {joint_pairs_list}")
     except (ValueError, SyntaxError):
-        raise ValueError("joint_pairs invalid format. Please provide a valid list of tuples, e.g., '[(0,4),(1,5)]'") 
-    T = args.T  # diffusion steps
-    
-    # Set device (CPU or GPU)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    logging.info(f"Using device: {device}")
+        raise ValueError("joint_pairs invalid format. Please provide a valid list of tuples, e.g., '[(0,4),(1,5)]'")
+    T = args.T
 
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    logging.info("Using device: %s", device)
 
     model = TripDiffusionModel(features_info, cond_info, T, joint_pairs_list).to(device)
     logging.info("Using HCD v2: shared transformer + soft causal adapters.")
 
     if args.checkpoint:
-        logging.info(f"Loading model checkpoint from {args.checkpoint}")
+        logging.info("Loading model checkpoint from %s", args.checkpoint)
         state_dict = torch.load(args.checkpoint, map_location=device)
-
         from collections import OrderedDict
+
         new_state_dict = OrderedDict()
         for k, v in state_dict.items():
-            new_key = k.replace('module.', '') if k.startswith('module.') else k
+            new_key = k.replace("module.", "") if k.startswith("module.") else k
             new_state_dict[new_key] = v
-            
         model.load_state_dict(new_state_dict)
         logging.info("Model checkpoint loaded successfully.")
 
-    if args.parallel == True:
+    if args.parallel:
         model = nn.DataParallel(model)
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
-    
+
     if not args.eval_only:
-        lambda_weight = args.lambda_weight
-        lambda_joint = args.lambda_joint
-        
         logging.info("Loading Dataset: %s", args.traindata)
         logging.info("Training with %d epochs, batch size %d", args.epochs, args.batch_size)
-
-        # Load dataset
         if args.traindata:
             dataset = utils.train_utils.load_data(args.traindata, features_info, cond_info)
         else:
             logging.info("No dataset file provided. Generating synthetic data.")
             dataset = utils.train_utils.generate_synthetic_trips(num_samples=1000)
         utils.train_utils.train_model(
-            model, 
-            optimizer, 
-            dataset, 
-            features_info, 
-            lambda_weight, 
-            lambda_joint, 
-            T, 
-            epochs=args.epochs, 
-            batch_size=args.batch_size, 
+            model,
+            optimizer,
+            dataset,
+            features_info,
+            args.lambda_weight,
+            args.lambda_joint,
+            T,
+            epochs=args.epochs,
+            batch_size=args.batch_size,
             device=device,
             loss_type=args.loss_type,
             causal_weight=args.causal_weight,
@@ -138,31 +171,29 @@ def main(args):
             batch_sampling=args.batch_sampling,
             sampling_feature=args.sampling_feature,
             sampling_power=args.sampling_power,
-            t_sampling=args.t_sampling)
+            t_sampling=args.t_sampling,
+        )
     else:
         logging.info("Evaluation only mode. Skipping training.")
 
-    # Save the trained model
+    gate_values = _report_gate_values(model)
     logging.info("Model saved to %s", model_file)
 
-    # Generate samples from the trained model
     test_df = pd.read_csv(args.testdata)
     train_eval_df = pd.read_csv(args.traindata) if args.traindata else None
     sample_start = time.perf_counter()
     generated_samples, truth_samples = utils.train_utils.sample_trip(
-        model, 
-        test_df, 
+        model,
+        test_df,
         num_samples=args.num_samples,
-        device=device
+        device=device,
     )
     sampling_seconds = float(time.perf_counter() - sample_start)
     logging.info("Sampling completed in %.4f seconds for %d samples.", sampling_seconds, args.num_samples)
-    utils.train_utils.save_generated_samples(generated_samples, output_file = generation_file)
-
+    utils.train_utils.save_generated_samples(generated_samples, output_file=generation_file)
 
     truth_trips_all = [s["trip"] for s in truth_samples]
     generated_trips_all = [s["trip"] for s in generated_samples]
-    
     eva_all = utils.test_utils.evaluate_generated_trips(
         truth_trips_all,
         generated_trips_all,
@@ -170,24 +201,69 @@ def main(args):
         generated_samples=generated_samples,
         cond_info=cond_info,
         train_real_df=train_eval_df,
-        test_real_df=test_df
+        test_real_df=test_df,
+        random_state=seed,
     )
     logging.info("Evaluation results on all data: %s", eva_all)
 
     metrics_payload = {
+        "seed": int(seed),
         "T": int(T),
         "num_samples": int(args.num_samples),
         "sampling_seconds": sampling_seconds,
         "sampling_seconds_per_10k": float(sampling_seconds * (10000.0 / max(float(args.num_samples), 1.0))),
         "evaluation": eva_all,
     }
+    if gate_values is not None:
+        metrics_payload["gate_values"] = gate_values
+
     os.makedirs(os.path.dirname(metrics_file) or ".", exist_ok=True)
     with open(metrics_file, "w", encoding="utf-8") as f:
         json.dump(metrics_payload, f, ensure_ascii=False, indent=2)
     logging.info("Saved metrics JSON: %s", metrics_file)
-
     logging.info("Training and evaluation completed. Generated samples saved to %s", generation_file)
-    print("Training and evaluation completed. Check logs and saved model in:", exp_dir)
+
+    return metrics_payload
+
+
+def main(args):
+    seeds = parse_seeds(args.seed, args.seeds, args.num_seeds, args.seed_start)
+
+    if len(seeds) == 1:
+        if args.exp_dir is None:
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            exp_dir = os.path.join("exp", datetime.datetime.now().strftime("%Y%m%d"), timestamp)
+        else:
+            exp_dir = args.exp_dir
+        run_once(args, seeds[0], exp_dir)
+        print("Training and evaluation completed. Check logs and saved model in:", exp_dir)
+        return
+
+    if args.exp_dir is not None:
+        output_root = args.exp_dir
+    else:
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_root = os.path.join("exp", datetime.datetime.now().strftime("%Y%m%d"), f"multiseed_{timestamp}")
+
+    os.makedirs(output_root, exist_ok=True)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    logging.info("Running HCD v2 across %d seeds: %s", len(seeds), seeds)
+
+    single_args = copy.copy(args)
+    single_args.metrics_file = None
+    result = run_multiseed(
+        args=single_args,
+        seeds=seeds,
+        run_once=run_once,
+        output_root=output_root,
+        experiment_name="HCD_v2",
+    )
+    print("Multi-seed experiment completed. Summary:", result["summary"])
+    print("Artifacts saved under:", output_root)
 
 
 if __name__ == "__main__":
@@ -197,12 +273,12 @@ if __name__ == "__main__":
     parser.add_argument("--patience", type=int, default=10, help="Number of epochs to wait for improvement before early stopping.")
     parser.add_argument("--min_delta", type=float, default=1e-4, help="Minimum change in loss to qualify as an improvement.")
     parser.add_argument("--epochs", type=int, default=100, help="Number of training epochs")
-    parser.add_argument("--batch_size", type=int, default=500, help="Batch size for training")
-    parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
+    parser.add_argument("--batch_size", type=int, default=256, help="Batch size for training")
+    parser.add_argument("--lr", type=float, default=1e-2, help="Learning rate")
     parser.add_argument("--lambda_weight", type=float, default=2.0, help="Weight for auxiliary loss")
     parser.add_argument("--lambda_joint", type=float, default=0.5, help="Weight for joint loss")
-    parser.add_argument("--T", type=int, default=100, help="Diffusion steps")
-    parser.add_argument("--parallel", type=bool, default=True, help="Parallel computing")
+    parser.add_argument("--T", type=int, default=10, help="Diffusion steps")
+    parser.add_argument("--parallel", type=bool, default=False, help="Parallel computing")
     parser.add_argument("--num_samples", type=int, default=10000, help="Number of samples to generate after training")
     parser.add_argument("--exp_dir", type=str, default=None, help="Directory to save logs and models (default: auto timestamp)")
     parser.add_argument("--joint_pairs", type=str, default="[(0,4),(1,5),(2,6),(3,6),(2,3),(6,7)]", help="List of joint feature pairs for joint loss, e.g., [(0,4),(1,5)]")
@@ -215,7 +291,7 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint", type=str, default=None, help="Path to pre-trained model.pth")
     parser.add_argument("--eval_only", action="store_true", help="Set this flag to skip training and only evaluate")
     parser.add_argument("--metrics_file", type=str, default=None, help="Path to write metrics JSON (default: <exp_dir>/generated_samples_metrics.json)")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
-    
+    add_multiseed_arguments(parser, default_num_seeds=5)
+
     args = parser.parse_args()
     main(args)

@@ -1,3 +1,14 @@
+import sys
+from pathlib import Path
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from project_paths import setup
+
+setup()
+
 import os
 from typing import Dict, List, Sequence, Tuple
 
@@ -85,9 +96,9 @@ def _configure_academic_style() -> None:
             "font.serif": ["Times New Roman", "STIXGeneral", "DejaVu Serif"],
             "mathtext.fontset": "stix",
             "axes.unicode_minus": False,
-            "font.size": 15,
-            "axes.labelsize": 18,
-            "axes.titlesize": 18,
+            "font.size": 17,
+            "axes.labelsize": 20,
+            "axes.titlesize": 20,
             "figure.dpi": 150,
             "savefig.dpi": 300,
         }
@@ -271,14 +282,14 @@ def _plot_vertical_heatmap_comparison(
                 f"{pct:.1f}%",
                 ha="center",
                 va="center",
-                fontsize=15,
+                fontsize=17,
                 color=text_color,
             )
 
         ax.set_xticks([])
         ax.set_yticks(np.arange(len(row_labels)))
         if i % n_cols == 0:
-            ax.set_yticklabels(row_labels, fontsize=20)
+            ax.set_yticklabels(row_labels, fontsize=22)
         else:
             ax.set_yticklabels([])
         ax.set_title(model_labels[i], pad=6)
@@ -332,14 +343,14 @@ def _plot_joint_time_heatmap_comparison(
 
         ax.set_xticks(tick_pos)
         if i // n_cols == n_rows - 1:
-            ax.set_xticklabels(tick_labels, fontsize=15)
+            ax.set_xticklabels(tick_labels, fontsize=17)
         else:
             ax.set_xticklabels([])
         ax.tick_params(axis="x", labelrotation=0)
 
         ax.set_yticks(np.arange(len(row_labels)))
         if i % n_cols == 0:
-            ax.set_yticklabels(row_labels, fontsize=20)
+            ax.set_yticklabels(row_labels, fontsize=22)
         else:
             ax.set_yticklabels([])
         ax.set_title(model_labels[i], pad=6)
@@ -396,12 +407,12 @@ def _plot_od_matrix_heatmap_comparison(
         ax.set_yticks(y_idx[::y_step])
 
         if i // n_cols == n_rows - 1:
-            ax.set_xticklabels([str(end_order[j]) for j in x_idx[::x_step]], fontsize=15)
+            ax.set_xticklabels([str(end_order[j]) for j in x_idx[::x_step]], fontsize=17)
         else:
             ax.set_xticklabels([])
 
         if i % n_cols == 0:
-            ax.set_yticklabels([str(start_order[j]) for j in y_idx[::y_step]], fontsize=15)
+            ax.set_yticklabels([str(start_order[j]) for j in y_idx[::y_step]], fontsize=17)
         else:
             ax.set_yticklabels([])
 

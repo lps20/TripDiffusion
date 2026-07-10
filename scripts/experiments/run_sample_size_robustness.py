@@ -1,3 +1,14 @@
+import sys
+from pathlib import Path
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from project_paths import setup
+
+setup()
+
 import argparse
 import json
 import logging
@@ -8,14 +19,16 @@ from typing import Dict, List, Tuple
 
 import pandas as pd
 
+import utils.test_utils
+
 
 MODEL_CONFIGS: Dict[str, Dict[str, str]] = {
     "hcd_v2": {
-        "script": "run_hcd_v2.py",
+        "script": "scripts/train/run_hcd_v2.py",
         "label": "HCD_V2",
     },
     "ddpm_tf": {
-        "script": "run_transformer.py",
+        "script": "scripts/train/run_transformer.py",
         "label": "DDPM_TF",
     },
 }
@@ -40,26 +53,15 @@ def _read_metrics(path: str) -> Dict:
 
 
 def _flatten_metrics(model_name: str, subset_pct: int, subset_size: int, exp_dir: str, metrics: Dict) -> Dict:
-    row = {
-        "model": model_name,
-        "subset_pct": subset_pct,
-        "subset_size": subset_size,
-        "exp_dir": exp_dir,
-        "joint_js": metrics.get("joint_js"),
-        "logical_validity_rate": metrics.get("logical_validity_rate"),
-        "tstr_macro_f1": metrics.get("tstr_macro_f1"),
-        "trtr_macro_f1": metrics.get("trtr_macro_f1"),
-        "tstr_accuracy": metrics.get("tstr_accuracy"),
-        "trtr_accuracy": metrics.get("trtr_accuracy"),
-        "tstr_trtr_f1_ratio": metrics.get("tstr_trtr_f1_ratio"),
-    }
-    for feat_name, value in metrics.get("single_feature_jsd", {}).items():
-        row[f"jsd_{feat_name}"] = value
-    for rule_name, value in metrics.get("invalid_rule_breakdown", {}).items():
-        row[f"lvr_{rule_name}"] = value
-    row["n_total"] = metrics.get("n_total")
-    row["n_valid"] = metrics.get("n_valid")
-    row["n_invalid"] = metrics.get("n_invalid")
+    row = utils.test_utils.flatten_evaluation_metrics(
+        model_name=model_name,
+        metrics=metrics,
+        extra_fields={
+            "subset_pct": subset_pct,
+            "subset_size": subset_size,
+            "exp_dir": exp_dir,
+        },
+    )
     return row
 
 
@@ -142,6 +144,10 @@ def main(args: argparse.Namespace) -> None:
                 str(args.num_samples),
                 "--lr",
                 str(args.lr),
+                "--num_seeds",
+                "1",
+                "--seed",
+                str(args.seed),
             ]
             if model_key == "hcd_v2" and args.hcd_loss_type is not None:
                 train_cmd.extend(["--loss_type", args.hcd_loss_type])
@@ -150,7 +156,7 @@ def main(args: argparse.Namespace) -> None:
             generated_csv = os.path.join(exp_dir, "generated_samples.csv")
             eval_cmd = [
                 sys.executable,
-                "evaluate_generated_csv.py",
+                "scripts/eval/evaluate_generated_csv.py",
                 "--generated_csv",
                 generated_csv,
                 "--train_data",
@@ -174,12 +180,12 @@ def main(args: argparse.Namespace) -> None:
             )
             _upsert_summary(summary_path, row)
             logging.info(
-                "Finished %s at %d%%: joint_js=%s, LVR=%s, TSTR_F1=%s",
+                "Finished %s at %d%%: joint_js=%s, LVR=%s, MNL sim=%s",
                 model_label,
                 subset_pct,
                 metrics.get("joint_js"),
                 metrics.get("logical_validity_rate"),
-                metrics.get("tstr_macro_f1"),
+                metrics.get("mnl_behavioral_similarity"),
             )
 
     logging.info("Saved robustness summary: %s", summary_path)
