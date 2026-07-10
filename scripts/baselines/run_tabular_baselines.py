@@ -49,6 +49,10 @@ TRIP_SCHEMA = [
 ]
 
 COND_COLUMNS = ["relation", "sex", "age_code", "job_type"]
+LOC_COLUMNS = ["start_type", "start_zcode_num", "end_type", "end_zcode_num"]
+TIME_COLUMNS = ["start_time_num_6", "trip_time_num_6"]
+ACT_COLUMN = "act_num"
+MODE_COLUMN = "mode_num"
 TRIP_COLUMNS = [f["name"] for f in TRIP_SCHEMA]
 ALL_COLUMNS = COND_COLUMNS + TRIP_COLUMNS
 FULL_SCHEMA = [
@@ -442,6 +446,82 @@ def _sample_model(model: Any, n_samples: int, columns: List[str]) -> pd.DataFram
     return pd.DataFrame(generated, columns=columns)
 
 
+def _build_datgan_metadata(continuous_time: bool = True) -> Dict[str, Dict[str, Any]]:
+    """Column metadata for DATGAN; time fields as discrete-bounded continuous when requested."""
+    schema_by_name = {field["name"]: field for field in FULL_SCHEMA}
+    metadata: Dict[str, Dict[str, Any]] = {}
+    continuous_cols = set(TIME_COLUMNS) if continuous_time else set()
+    for col in ALL_COLUMNS:
+        if col in continuous_cols:
+            upper = int(schema_by_name[col]["num_classes"]) - 1
+            metadata[col] = {
+                "type": "continuous",
+                "discrete": True,
+                "bounds": [0, upper],
+                "enforce_bounds": True,
+            }
+        else:
+            metadata[col] = {"type": "categorical"}
+    return metadata
+
+
+def _build_datgan_cascade_dag():
+    """
+    DAG aligned with HCD v2 cascade:
+      demo -> act -> (loc, time) -> mode
+    with act->time/loc and loc->mode emphasis.
+    """
+    import networkx as nx
+
+    dag = nx.DiGraph()
+
+    for parent, child in zip(COND_COLUMNS, COND_COLUMNS[1:]):
+        dag.add_edge(parent, child)
+
+    for demo in COND_COLUMNS:
+        dag.add_edge(demo, ACT_COLUMN)
+
+    for demo in COND_COLUMNS:
+        for loc_col in LOC_COLUMNS:
+            dag.add_edge(demo, loc_col)
+        for time_col in TIME_COLUMNS:
+            dag.add_edge(demo, time_col)
+
+    for loc_col in LOC_COLUMNS:
+        dag.add_edge(ACT_COLUMN, loc_col)
+    for time_col in TIME_COLUMNS:
+        dag.add_edge(ACT_COLUMN, time_col)
+
+    dag.add_edge("start_type", "start_zcode_num")
+    dag.add_edge("start_zcode_num", "end_type")
+    dag.add_edge("end_type", "end_zcode_num")
+    dag.add_edge("start_time_num_6", "trip_time_num_6")
+
+    dag.add_edge(ACT_COLUMN, MODE_COLUMN)
+    for loc_col in LOC_COLUMNS:
+        dag.add_edge(loc_col, MODE_COLUMN)
+    for time_col in TIME_COLUMNS:
+        dag.add_edge(time_col, MODE_COLUMN)
+    for demo in COND_COLUMNS:
+        dag.add_edge(demo, MODE_COLUMN)
+
+    missing = set(ALL_COLUMNS) - set(dag.nodes)
+    if missing:
+        raise ValueError(f"DATGAN cascade DAG missing nodes: {sorted(missing)}")
+
+    order = list(nx.topological_sort(dag))
+    logging.info("DATGAN cascade DAG topological order: %s", order)
+    return dag
+
+
+def _resolve_datgan_dag(dag_mode: str):
+    if dag_mode == "cascade":
+        return _build_datgan_cascade_dag()
+    if dag_mode == "linear":
+        return None
+    raise ValueError(f"Unsupported datgan_dag mode: {dag_mode}")
+
+
 def _run_ctgan(
     train_df: pd.DataFrame,
     all_columns: List[str],
@@ -466,6 +546,8 @@ def _run_datgan(
     output_dir: str,
     epochs: int,
     batch_size: int,
+    dag_mode: str = "cascade",
+    continuous_time: bool = True,
 ) -> pd.DataFrame:
     datgan_class = _import_datgan_class()
     os.makedirs(output_dir, exist_ok=True)
@@ -485,9 +567,8 @@ def _run_datgan(
     )
     model = datgan_class(**init_kwargs)
 
-    # DATGAN requires explicit metadata on first preprocessing.
-    # This dataset is discretized tabular codes, so we treat all columns as categorical by default.
-    metadata = {col: {"type": "categorical"} for col in all_columns}
+    metadata = _build_datgan_metadata(continuous_time=continuous_time)
+    dag = _resolve_datgan_dag(dag_mode)
     fit_fn = getattr(model, "fit", None)
     if fit_fn is None:
         raise AttributeError("DATGAN model has no `fit` method.")
@@ -496,8 +577,16 @@ def _run_datgan(
         fit_fn,
         {
             "metadata": metadata,
+            "dag": dag,
             "preprocessed_data_path": os.path.join(output_dir, "encoded_data"),
         },
+    )
+    logging.info(
+        "DATGAN fit config: dag_mode=%s, continuous_time=%s, epochs=%d, batch_size=%d",
+        dag_mode,
+        continuous_time,
+        epochs,
+        batch_size,
     )
     fit_fn(train_df[all_columns], **fit_kwargs)
     return _sample_model(model, n_samples, all_columns)
@@ -710,6 +799,8 @@ def _run_model_for_seed(
             output_dir=args.datgan_output_dir,
             epochs=args.epochs,
             batch_size=args.batch_size,
+            dag_mode=args.datgan_dag,
+            continuous_time=args.datgan_continuous_time,
         )
     raise ValueError(f"Unsupported model: {model_name}")
 
@@ -830,6 +921,19 @@ if __name__ == "__main__":
     parser.add_argument("--testdata", type=str, default="data/test_data.csv")
     parser.add_argument("--output_dir", type=str, default="exp/baseline")
     parser.add_argument("--datgan_output_dir", type=str, default="exp/baseline/datgan_model")
+    parser.add_argument(
+        "--datgan_dag",
+        type=str,
+        default="cascade",
+        choices=["cascade", "linear"],
+        help="DATGAN DAG: cascade matches HCD (demo->act->loc/time->mode); linear uses column order.",
+    )
+    parser.add_argument(
+        "--datgan_continuous_time",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Treat start/trip time columns as continuous in DATGAN metadata.",
+    )
     parser.add_argument(
         "--models",
         nargs="+",
