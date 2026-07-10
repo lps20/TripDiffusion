@@ -2,8 +2,10 @@ import sys
 from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
-if str(_REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(_REPO_ROOT))
+_BASELINES_DIR = Path(__file__).resolve().parent
+for _path in (_REPO_ROOT, _BASELINES_DIR):
+    if str(_path) not in sys.path:
+        sys.path.insert(0, str(_path))
 
 from project_paths import setup
 
@@ -91,6 +93,31 @@ def _import_ctgan_class():
         raise ImportError(
             "CTGAN is not installed. Install with: pip install ctgan"
         ) from exc
+
+
+def _import_tvae_class():
+    try:
+        module = importlib.import_module("sdv.single_table")
+        return getattr(module, "TVAESynthesizer")
+    except Exception as exc:
+        raise ImportError(
+            "SDV (TVAE) is not installed. Install with: pip install sdv"
+        ) from exc
+
+
+def _build_sdv_metadata(train_df: pd.DataFrame, columns: List[str]):
+    try:
+        from sdv.metadata import SingleTableMetadata
+    except Exception as exc:
+        raise ImportError(
+            "SDV metadata is not available. Install with: pip install sdv"
+        ) from exc
+
+    metadata = SingleTableMetadata()
+    metadata.detect_from_dataframe(train_df[columns])
+    for col in columns:
+        metadata.update_column(col, sdtype="categorical")
+    return metadata
 
 
 def _patch_sklearn_onehot_for_datgan() -> None:
@@ -304,6 +331,7 @@ def _run_vae(
     hidden_dim: int,
     beta_kl: float,
     seed: int,
+    model_save_path: Optional[str] = None,
 ) -> pd.DataFrame:
     _set_seed(seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -338,6 +366,16 @@ def _run_vae(
 
         avg_loss = total_loss / max(len(dataset), 1)
         logging.info("VAE epoch %d/%d avg_loss=%.6f", epoch + 1, epochs, avg_loss)
+
+    if model_save_path:
+        _save_vae_checkpoint(
+            model_save_path,
+            model=model,
+            fields=fields,
+            hidden_dim=hidden_dim,
+            latent_dim=latent_dim,
+            beta_kl=beta_kl,
+        )
 
     model.eval()
     out_rows = []
@@ -522,12 +560,69 @@ def _resolve_datgan_dag(dag_mode: str):
     raise ValueError(f"Unsupported datgan_dag mode: {dag_mode}")
 
 
+def _baseline_model_paths(output_dir: str, model_name: str) -> Dict[str, str]:
+    tag = model_name.upper()
+    return {
+        "ctgan": os.path.join(output_dir, f"{tag}_model.pkl"),
+        "tvae": os.path.join(output_dir, f"{tag}_model.pkl"),
+        "vae": os.path.join(output_dir, f"{tag}_model.pt"),
+        "ddpm_tf": os.path.join(output_dir, f"{tag}_model.pth"),
+        "tabddpm": os.path.join(output_dir, f"{tag}_model.pth"),
+        "datgan_dir": os.path.join(output_dir, f"{tag}_model"),
+    }
+
+
+def _save_vae_checkpoint(
+    path: str,
+    model: "_TabularVAE",
+    fields: List[Dict[str, Any]],
+    hidden_dim: int,
+    latent_dim: int,
+    beta_kl: float,
+) -> None:
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    torch.save(
+        {
+            "model_type": "tabular_vae",
+            "state_dict": model.state_dict(),
+            "fields": fields,
+            "hidden_dim": hidden_dim,
+            "latent_dim": latent_dim,
+            "beta_kl": beta_kl,
+        },
+        path,
+    )
+    logging.info("Saved VAE checkpoint: %s", path)
+
+
+def _save_ddpm_checkpoint(
+    path: str,
+    model: nn.Module,
+    features_info: List[Dict[str, Any]],
+    cond_info: List[Dict[str, Any]],
+    T: int,
+) -> None:
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    torch.save(
+        {
+            "model_type": "ddpm_transformer",
+            "state_dict": model.state_dict(),
+            "features_info": features_info,
+            "cond_info": cond_info,
+            "T": T,
+        },
+        path,
+    )
+    logging.info("Saved DDPM-Transformer checkpoint: %s", path)
+
+
 def _run_ctgan(
     train_df: pd.DataFrame,
     all_columns: List[str],
     n_samples: int,
     epochs: int,
     batch_size: int,
+    model_save_path: Optional[str] = None,
 ) -> pd.DataFrame:
     ctgan_class = _import_ctgan_class()
     init_kwargs = _filter_kwargs(
@@ -536,6 +631,40 @@ def _run_ctgan(
     )
     model = ctgan_class(**init_kwargs)
     _fit_model_with_discrete_columns(model, train_df[all_columns], all_columns)
+    if model_save_path:
+        os.makedirs(os.path.dirname(model_save_path) or ".", exist_ok=True)
+        model.save(model_save_path)
+        logging.info("Saved CTGAN checkpoint: %s", model_save_path)
+    return _sample_model(model, n_samples, all_columns)
+
+
+def _run_tvae(
+    train_df: pd.DataFrame,
+    all_columns: List[str],
+    n_samples: int,
+    epochs: int,
+    batch_size: int,
+    model_save_path: Optional[str] = None,
+) -> pd.DataFrame:
+    tvae_class = _import_tvae_class()
+    metadata = _build_sdv_metadata(train_df, all_columns)
+    init_kwargs = _filter_kwargs(
+        tvae_class,
+        {
+            "epochs": epochs,
+            "batch_size": batch_size,
+            "verbose": True,
+            "embedding_dim": 128,
+            "compress_dims": (128, 128),
+            "decompress_dims": (128, 128),
+        },
+    )
+    model = tvae_class(metadata, **init_kwargs)
+    model.fit(train_df[all_columns])
+    if model_save_path:
+        os.makedirs(os.path.dirname(model_save_path) or ".", exist_ok=True)
+        model.save(model_save_path)
+        logging.info("Saved TVAE checkpoint: %s", model_save_path)
     return _sample_model(model, n_samples, all_columns)
 
 
@@ -548,6 +677,7 @@ def _run_datgan(
     batch_size: int,
     dag_mode: str = "cascade",
     continuous_time: bool = True,
+    save_model: bool = True,
 ) -> pd.DataFrame:
     datgan_class = _import_datgan_class()
     os.makedirs(output_dir, exist_ok=True)
@@ -560,7 +690,7 @@ def _run_datgan(
             "output": datgan_output,
             "num_epochs": epochs,
             "batch_size": batch_size,
-            "save_checkpoints": False,
+            "save_checkpoints": save_model,
             "restore_session": False,
             "verbose": 1,
         },
@@ -589,6 +719,8 @@ def _run_datgan(
         batch_size,
     )
     fit_fn(train_df[all_columns], **fit_kwargs)
+    if save_model:
+        logging.info("Saved DATGAN artifacts under: %s", output_dir)
     return _sample_model(model, n_samples, all_columns)
 
 
@@ -603,6 +735,7 @@ def _run_ddpm_transformer(
     lambda_weight: float,
     lambda_joint: float,
     seed: int,
+    model_save_path: Optional[str] = None,
 ) -> pd.DataFrame:
     _set_seed(seed)
     from model.Transformer_Net import TripDiffusionModel as DDPMTransformerModel
@@ -655,7 +788,7 @@ def _run_ddpm_transformer(
         device=device,
         loss_type="standard",
         causal_weight=None,
-        model_save_path=None,
+        model_save_path=model_save_path,
         patience=max(epochs, 1),
         min_delta=0.0,
         batch_sampling="shuffle",
@@ -663,12 +796,21 @@ def _run_ddpm_transformer(
         sampling_power=1.0,
         t_sampling="uniform",
     )
+    if model_save_path:
+        _save_ddpm_checkpoint(
+            model_save_path,
+            model=model,
+            features_info=ddpm_features_info,
+            cond_info=ddpm_cond_info,
+            T=T,
+        )
 
     generated_samples, _ = utils.train_utils.sample_trip(
         model=model,
         df=test_df,
         num_samples=n_samples,
         device=device,
+        match_test_one_to_one=(n_samples is None or n_samples <= 0),
     )
 
     rows = []
@@ -758,6 +900,9 @@ def _run_model_for_seed(
     output_dir: str,
     save_outputs: bool,
 ) -> pd.DataFrame:
+    model_paths = _baseline_model_paths(output_dir, model_name)
+    save_models = not args.no_save_models
+
     if model_name == "ctgan":
         return _run_ctgan(
             train_df=train_df,
@@ -765,6 +910,33 @@ def _run_model_for_seed(
             n_samples=args.num_samples,
             epochs=args.epochs,
             batch_size=args.batch_size,
+            model_save_path=model_paths["ctgan"] if save_models else None,
+        )
+    if model_name == "tvae":
+        return _run_tvae(
+            train_df=train_df,
+            all_columns=ALL_COLUMNS,
+            n_samples=args.num_samples,
+            epochs=args.epochs,
+            batch_size=args.batch_size,
+            model_save_path=model_paths["tvae"] if save_models else None,
+        )
+    if model_name == "tabddpm":
+        from tab_ddpm_baseline import run_tabddpm
+
+        return run_tabddpm(
+            train_df=train_df,
+            all_columns=ALL_COLUMNS,
+            time_columns=TIME_COLUMNS,
+            schema=FULL_SCHEMA,
+            n_samples=args.num_samples,
+            epochs=args.epochs,
+            batch_size=args.batch_size,
+            lr=args.lr,
+            num_timesteps=args.tabddpm_t,
+            seed=seed,
+            model_save_path=model_paths["tabddpm"] if save_models else None,
+            hidden_layers=args.tabddpm_hidden_layers,
         )
     if model_name == "vae":
         return _run_vae(
@@ -777,6 +949,7 @@ def _run_model_for_seed(
             hidden_dim=args.vae_hidden_dim,
             beta_kl=args.vae_beta_kl,
             seed=seed,
+            model_save_path=model_paths["vae"] if save_models else None,
         )
     if model_name == "ddpm_tf":
         return _run_ddpm_transformer(
@@ -790,17 +963,20 @@ def _run_model_for_seed(
             lambda_weight=args.ddpm_lambda_weight,
             lambda_joint=args.ddpm_lambda_joint,
             seed=seed,
+            model_save_path=model_paths["ddpm_tf"] if save_models else None,
         )
     if model_name == "datgan":
+        datgan_dir = model_paths["datgan_dir"] if save_models else args.datgan_output_dir
         return _run_datgan(
             train_df=train_df,
             all_columns=ALL_COLUMNS,
             n_samples=args.num_samples,
-            output_dir=args.datgan_output_dir,
+            output_dir=datgan_dir,
             epochs=args.epochs,
             batch_size=args.batch_size,
             dag_mode=args.datgan_dag,
             continuous_time=args.datgan_continuous_time,
+            save_model=save_models,
         )
     raise ValueError(f"Unsupported model: {model_name}")
 
@@ -915,12 +1091,19 @@ def main(args: argparse.Namespace) -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Train and evaluate tabular baselines: CTGAN / DATGAN / VAE / DDPM-Transformer."
+        description=(
+            "Train and evaluate tabular baselines: CTGAN / TVAE / TabDDPM / DATGAN / VAE / DDPM-Transformer."
+        )
     )
     parser.add_argument("--traindata", type=str, default="data/train_data.csv")
     parser.add_argument("--testdata", type=str, default="data/test_data.csv")
     parser.add_argument("--output_dir", type=str, default="exp/baseline")
     parser.add_argument("--datgan_output_dir", type=str, default="exp/baseline/datgan_model")
+    parser.add_argument(
+        "--no_save_models",
+        action="store_true",
+        help="Skip saving trained baseline model checkpoints.",
+    )
     parser.add_argument(
         "--datgan_dag",
         type=str,
@@ -938,7 +1121,7 @@ if __name__ == "__main__":
         "--models",
         nargs="+",
         default=["datgan"],
-        choices=["ctgan", "datgan", "vae", "ddpm_tf"],
+        choices=["ctgan", "tvae", "tabddpm", "datgan", "vae", "ddpm_tf"],
         help="Which baselines to run.",
     )
     parser.add_argument("--num_samples", type=int, default=10000)
@@ -949,6 +1132,14 @@ if __name__ == "__main__":
     parser.add_argument("--vae_hidden_dim", type=int, default=256)
     parser.add_argument("--vae_beta_kl", type=float, default=0.01)
     parser.add_argument("--ddpm_t", type=int, default=10, help="Diffusion steps for ddpm_tf baseline.")
+    parser.add_argument("--tabddpm_t", type=int, default=100, help="Diffusion steps for TabDDPM baseline.")
+    parser.add_argument(
+        "--tabddpm_hidden_layers",
+        nargs="+",
+        type=int,
+        default=[256, 512, 512, 256],
+        help="MLP hidden layer sizes for TabDDPM denoiser.",
+    )
     parser.add_argument("--ddpm_lambda_weight", type=float, default=1.0)
     parser.add_argument("--ddpm_lambda_joint", type=float, default=0.0)
     add_multiseed_arguments(parser, default_num_seeds=5)

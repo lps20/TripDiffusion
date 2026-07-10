@@ -181,15 +181,23 @@ def run_once(args, seed, exp_dir):
 
     test_df = pd.read_csv(args.testdata)
     train_eval_df = pd.read_csv(args.traindata) if args.traindata else None
+    match_test = not args.random_condition_sampling
     sample_start = time.perf_counter()
     generated_samples, truth_samples = utils.train_utils.sample_trip(
         model,
         test_df,
         num_samples=args.num_samples,
         device=device,
+        match_test_one_to_one=match_test,
     )
+    num_generated = len(generated_samples)
     sampling_seconds = float(time.perf_counter() - sample_start)
-    logging.info("Sampling completed in %.4f seconds for %d samples.", sampling_seconds, args.num_samples)
+    logging.info(
+        "Sampling completed in %.4f seconds for %d samples (match_test=%s).",
+        sampling_seconds,
+        num_generated,
+        match_test,
+    )
     utils.train_utils.save_generated_samples(generated_samples, output_file=generation_file)
 
     truth_trips_all = [s["trip"] for s in truth_samples]
@@ -209,9 +217,10 @@ def run_once(args, seed, exp_dir):
     metrics_payload = {
         "seed": int(seed),
         "T": int(T),
-        "num_samples": int(args.num_samples),
+        "num_samples": int(num_generated),
+        "eval_sampling": "match_test_one_to_one" if match_test else "random_with_replacement",
         "sampling_seconds": sampling_seconds,
-        "sampling_seconds_per_10k": float(sampling_seconds * (10000.0 / max(float(args.num_samples), 1.0))),
+        "sampling_seconds_per_10k": float(sampling_seconds * (10000.0 / max(float(num_generated), 1.0))),
         "evaluation": eva_all,
     }
     if gate_values is not None:
@@ -279,7 +288,18 @@ if __name__ == "__main__":
     parser.add_argument("--lambda_joint", type=float, default=0.5, help="Weight for joint loss")
     parser.add_argument("--T", type=int, default=10, help="Diffusion steps")
     parser.add_argument("--parallel", type=bool, default=False, help="Parallel computing")
-    parser.add_argument("--num_samples", type=int, default=10000, help="Number of samples to generate after training")
+    parser.add_argument(
+        "--num_samples",
+        type=int,
+        default=0,
+        help="Generated sample count when --random_condition_sampling is set (>0). "
+        "Default 0 uses the full test set with 1:1 matched conditions.",
+    )
+    parser.add_argument(
+        "--random_condition_sampling",
+        action="store_true",
+        help="Randomly sample test conditions with replacement instead of 1:1 full-test generation.",
+    )
     parser.add_argument("--exp_dir", type=str, default=None, help="Directory to save logs and models (default: auto timestamp)")
     parser.add_argument("--joint_pairs", type=str, default="[(0,4),(1,5),(2,6),(3,6),(2,3),(6,7)]", help="List of joint feature pairs for joint loss, e.g., [(0,4),(1,5)]")
     parser.add_argument("--loss_type", type=str, default="standard", help="Type of loss function to use: 'standard' or 'causal'")

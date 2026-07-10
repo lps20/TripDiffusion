@@ -152,14 +152,23 @@ def run_diffusion_once(
 
     test_df = pd.read_csv(args.testdata)
     train_eval_df = pd.read_csv(args.traindata) if args.traindata else None
+    match_test = not getattr(args, "random_condition_sampling", False)
     sample_start = time.perf_counter()
     generated_samples, truth_samples = utils.train_utils.sample_trip(
         model,
         test_df,
         num_samples=args.num_samples,
         device=device,
+        match_test_one_to_one=match_test,
     )
+    num_generated = len(generated_samples)
     sampling_seconds = float(time.perf_counter() - sample_start)
+    logging.info(
+        "Sampling completed in %.4f seconds for %d samples (match_test=%s).",
+        sampling_seconds,
+        num_generated,
+        match_test,
+    )
     utils.train_utils.save_generated_samples(generated_samples, output_file=generation_file)
 
     eva_all = utils.test_utils.evaluate_generated_trips(
@@ -178,9 +187,10 @@ def run_diffusion_once(
         "seed": int(seed),
         "experiment": experiment_name,
         "T": int(T),
-        "num_samples": int(args.num_samples),
+        "num_samples": int(num_generated),
+        "eval_sampling": "match_test_one_to_one" if match_test else "random_with_replacement",
         "sampling_seconds": sampling_seconds,
-        "sampling_seconds_per_10k": float(sampling_seconds * (10000.0 / max(float(args.num_samples), 1.0))),
+        "sampling_seconds_per_10k": float(sampling_seconds * (10000.0 / max(float(num_generated), 1.0))),
         "evaluation": eva_all,
     }
     metrics_payload.update(extra_payload)
@@ -263,7 +273,18 @@ def add_common_diffusion_arguments(parser: argparse.ArgumentParser, description:
     parser.add_argument("--lambda_joint", type=float, default=0.0)
     parser.add_argument("--T", type=int, default=10)
     parser.add_argument("--parallel", type=bool, default=True)
-    parser.add_argument("--num_samples", type=int, default=10000)
+    parser.add_argument(
+        "--num_samples",
+        type=int,
+        default=0,
+        help="Generated sample count when --random_condition_sampling is set (>0). "
+        "Default 0 uses the full test set with 1:1 matched conditions.",
+    )
+    parser.add_argument(
+        "--random_condition_sampling",
+        action="store_true",
+        help="Randomly sample test conditions with replacement instead of 1:1 full-test generation.",
+    )
     parser.add_argument("--exp_dir", type=str, default=None)
     parser.add_argument("--joint_pairs", type=str, default="[(0,4),(1,5),(2,6),(3,6),(2,3),(6,7)]")
     parser.add_argument("--loss_type", type=str, default="standard", choices=["standard", "causal"])

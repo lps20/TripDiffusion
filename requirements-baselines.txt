@@ -1,4 +1,8 @@
 ctgan>=0.10.2
+sdv>=1.0.0
+
+# TabDDPM core is vendored under scripts/baselines/third_party/tab_ddpm/
+# (official: https://github.com/yandex-research/tab-ddpm)
 
 # DATGAN package variants differ across sources.
 # Install the one that supports:
