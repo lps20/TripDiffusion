@@ -125,8 +125,48 @@ def run_once(args, seed, exp_dir):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logging.info("Using device: %s", device)
 
-    model = TripDiffusionModel(features_info, cond_info, T, joint_pairs_list).to(device)
-    logging.info("Using HCD v2: shared transformer + soft causal adapters.")
+    d_model = args.d_model
+    shared_layers = args.shared_layers
+    causal_layers = args.causal_layers
+    if args.no_joint_heads:
+        d_model = d_model if d_model is not None else 192
+        shared_layers = shared_layers if shared_layers is not None else 3
+        causal_layers = causal_layers if causal_layers is not None else 3
+        logging.info(
+            "No joint heads: using marginal sample-statistics joint loss (%s); "
+            "d_model=%d, shared_layers=%d, causal_layers=%d",
+            args.joint_loss_mode,
+            d_model,
+            shared_layers,
+            causal_layers,
+        )
+    else:
+        d_model = d_model if d_model is not None else 128
+        shared_layers = shared_layers if shared_layers is not None else 2
+        causal_layers = causal_layers if causal_layers is not None else 2
+
+    model = TripDiffusionModel(
+        features_info,
+        cond_info,
+        T,
+        joint_pairs_list,
+        gate_init={
+            "act": args.gate_init_act,
+            "st": args.gate_init_st,
+            "mode": args.gate_init_mode,
+        },
+        st_cascade=args.st_cascade,
+        use_joint_heads=not args.no_joint_heads,
+        d_model=d_model,
+        shared_layers=shared_layers,
+        causal_layers=causal_layers,
+    ).to(device)
+    num_params = sum(p.numel() for p in model.parameters())
+    logging.info("Model parameters: %d (%.2f M)", num_params, num_params / 1e6)
+    if args.st_cascade:
+        logging.info("Using HCD v2 with ST loc/time cascade in causal adapters.")
+    else:
+        logging.info("Using HCD v2: shared transformer + soft causal adapters.")
 
     if args.checkpoint:
         logging.info("Loading model checkpoint from %s", args.checkpoint)
@@ -143,6 +183,10 @@ def run_once(args, seed, exp_dir):
     if args.parallel:
         model = nn.DataParallel(model)
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
+
+    feature_loss_weights = {}
+    if args.feature_loss_weights:
+        feature_loss_weights = json.loads(args.feature_loss_weights)
 
     if not args.eval_only:
         logging.info("Loading Dataset: %s", args.traindata)
@@ -172,6 +216,8 @@ def run_once(args, seed, exp_dir):
             sampling_feature=args.sampling_feature,
             sampling_power=args.sampling_power,
             t_sampling=args.t_sampling,
+            feature_loss_weights=feature_loss_weights,
+            joint_loss_mode=args.joint_loss_mode,
         )
     else:
         logging.info("Evaluation only mode. Skipping training.")
@@ -182,6 +228,18 @@ def run_once(args, seed, exp_dir):
     test_df = pd.read_csv(args.testdata)
     train_eval_df = pd.read_csv(args.traindata) if args.traindata else None
     match_test = not args.random_condition_sampling
+    joint_sample_steps = None
+    if args.joint_sampling_at_inference:
+        try:
+            joint_sample_steps = ast.literal_eval(args.joint_sample_steps)
+            if not isinstance(joint_sample_steps, (list, tuple)):
+                raise ValueError("joint_sample_steps must be a list of integers")
+            joint_sample_steps = [int(t) for t in joint_sample_steps]
+        except (ValueError, SyntaxError) as exc:
+            raise ValueError(
+                f"joint_sample_steps invalid format: {args.joint_sample_steps!r}"
+            ) from exc
+
     sample_start = time.perf_counter()
     generated_samples, truth_samples = utils.train_utils.sample_trip(
         model,
@@ -189,6 +247,9 @@ def run_once(args, seed, exp_dir):
         num_samples=args.num_samples,
         device=device,
         match_test_one_to_one=match_test,
+        use_joint_sampling=args.joint_sampling_at_inference,
+        joint_sample_steps=joint_sample_steps,
+        joint_gibbs_iters=args.joint_gibbs_iters,
     )
     num_generated = len(generated_samples)
     sampling_seconds = float(time.perf_counter() - sample_start)
@@ -219,6 +280,16 @@ def run_once(args, seed, exp_dir):
         "T": int(T),
         "num_samples": int(num_generated),
         "eval_sampling": "match_test_one_to_one" if match_test else "random_with_replacement",
+        "joint_sampling_at_inference": bool(args.joint_sampling_at_inference),
+        "joint_sample_steps": joint_sample_steps if args.joint_sampling_at_inference else None,
+        "joint_gibbs_iters": int(args.joint_gibbs_iters) if args.joint_sampling_at_inference else None,
+        "st_cascade": bool(args.st_cascade),
+        "use_joint_heads": not bool(args.no_joint_heads),
+        "joint_loss_mode": args.joint_loss_mode if args.no_joint_heads else "joint_head",
+        "d_model": int(d_model),
+        "shared_layers": int(shared_layers),
+        "causal_layers": int(causal_layers),
+        "num_parameters": int(num_params),
         "sampling_seconds": sampling_seconds,
         "sampling_seconds_per_10k": float(sampling_seconds * (10000.0 / max(float(num_generated), 1.0))),
         "evaluation": eva_all,
@@ -308,8 +379,54 @@ if __name__ == "__main__":
     parser.add_argument("--sampling_feature", type=str, default="act_num", help="Feature used for balanced batch sampling")
     parser.add_argument("--sampling_power", type=float, default=1.0, help="Strength of inverse-frequency reweighting for balanced sampling")
     parser.add_argument("--t_sampling", type=str, default="uniform", choices=["uniform", "sqrt", "late"], help="Diffusion timestep sampling strategy")
+    parser.add_argument("--gate_init_act", type=float, default=-1.0, help="Initial raw gate for act stream (sigmoid -> alpha).")
+    parser.add_argument("--gate_init_st", type=float, default=-1.0, help="Initial raw gate for space-time stream.")
+    parser.add_argument("--gate_init_mode", type=float, default=-1.0, help="Initial raw gate for mode stream.")
+    parser.add_argument(
+        "--feature_loss_weights",
+        type=str,
+        default=None,
+        help='JSON dict of per-feature CE/VB weights, e.g. \'{"start_zcode_num": 2.0, "end_zcode_num": 2.0}\'',
+    )
     parser.add_argument("--checkpoint", type=str, default=None, help="Path to pre-trained model.pth")
     parser.add_argument("--eval_only", action="store_true", help="Set this flag to skip training and only evaluate")
+    parser.add_argument(
+        "--no_joint_heads",
+        action="store_true",
+        help="Remove explicit joint heads; supervise pairs via marginal sample statistics.",
+    )
+    parser.add_argument(
+        "--joint_loss_mode",
+        type=str,
+        default="batch_stats",
+        choices=["batch_stats", "product"],
+        help="Joint loss without joint heads: batch co-occurrence KL or per-sample product CE.",
+    )
+    parser.add_argument("--d_model", type=int, default=None, help="Transformer hidden size.")
+    parser.add_argument("--shared_layers", type=int, default=None, help="Shared encoder layers.")
+    parser.add_argument("--causal_layers", type=int, default=None, help="Causal adapter layers.")
+    parser.add_argument(
+        "--joint_sampling_at_inference",
+        action="store_true",
+        help="Refine paired features at inference via joint heads or marginal-product Gibbs.",
+    )
+    parser.add_argument(
+        "--joint_sample_steps",
+        type=str,
+        default="[1]",
+        help="Reverse-diffusion timesteps for joint pair Gibbs sampling, e.g. '[1]' or '[1,2]'.",
+    )
+    parser.add_argument(
+        "--joint_gibbs_iters",
+        type=int,
+        default=3,
+        help="Gibbs sweeps over all joint pairs when joint_sampling_at_inference is enabled.",
+    )
+    parser.add_argument(
+        "--st_cascade",
+        action="store_true",
+        help="Use ST loc/time mini-cascade inside causal adapters (Step B).",
+    )
     parser.add_argument("--metrics_file", type=str, default=None, help="Path to write metrics JSON (default: <exp_dir>/generated_samples_metrics.json)")
     add_multiseed_arguments(parser, default_num_seeds=5)
 

@@ -203,3 +203,71 @@ def run_tabddpm(
     x_all = np.concatenate(generated, axis=0)[:n_samples]
     decoded = _decode_tabddpm_array(x_all, num_cols, cat_cols, schema_by_name)
     return decoded[all_columns]
+
+
+def _build_tabddpm_from_checkpoint(
+    checkpoint: Dict[str, Any],
+    schema: List[Dict[str, Any]],
+    device: torch.device,
+):
+    schema_by_name = {field["name"]: field for field in schema}
+    num_cols = list(checkpoint["num_cols"])
+    cat_cols = list(checkpoint["cat_cols"])
+    cat_sizes = np.array(checkpoint["cat_sizes"], dtype=np.int64)
+    num_timesteps = int(checkpoint["num_timesteps"])
+    layers = list(checkpoint.get("hidden_layers") or [256, 512, 512, 256])
+    num_numerical = len(num_cols)
+
+    d_in = int(cat_sizes.sum() + num_numerical)
+    model = MLPDiffusion(
+        d_in=d_in,
+        num_classes=0,
+        is_y_cond=False,
+        rtdl_params={"d_layers": layers, "dropout": 0.0},
+    ).to(device)
+    diffusion = GaussianMultinomialDiffusion(
+        num_classes=cat_sizes,
+        num_numerical_features=num_numerical,
+        denoise_fn=model,
+        num_timesteps=num_timesteps,
+        gaussian_loss_type="mse",
+        scheduler="cosine",
+        device=device,
+    ).to(device)
+
+    state_key = "ema_state_dict" if "ema_state_dict" in checkpoint else "state_dict"
+    diffusion._denoise_fn.load_state_dict(checkpoint[state_key])
+    diffusion.eval()
+    diffusion._denoise_fn.eval()
+    return diffusion, num_cols, cat_cols, schema_by_name
+
+
+def sample_tabddpm_from_checkpoint(
+    checkpoint_path: str,
+    schema: List[Dict[str, Any]],
+    n_samples: int,
+    batch_size: int = 500,
+    device: Optional[torch.device] = None,
+) -> pd.DataFrame:
+    device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    if checkpoint.get("model_type") != "tabddpm":
+        raise ValueError(f"Expected tabddpm checkpoint, got {checkpoint.get('model_type')!r}")
+
+    diffusion, num_cols, cat_cols, schema_by_name = _build_tabddpm_from_checkpoint(
+        checkpoint, schema, device
+    )
+    all_columns = list(checkpoint["all_columns"])
+    y_dummy = torch.tensor([1.0], device=device)
+
+    generated = []
+    remaining = n_samples
+    while remaining > 0:
+        bsz = min(batch_size, remaining)
+        x_gen, _ = diffusion.sample_all(bsz, bsz, y_dummy, ddim=False)
+        generated.append(x_gen.detach().cpu().numpy())
+        remaining -= bsz
+
+    x_all = np.concatenate(generated, axis=0)[:n_samples]
+    decoded = _decode_tabddpm_array(x_all, num_cols, cat_cols, schema_by_name)
+    return decoded[all_columns]

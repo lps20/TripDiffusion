@@ -156,13 +156,15 @@ def _average_marginal_effects(
     ame: Dict[str, Dict[str, float]] = {str(c): {} for c in classes}
 
     for feat_idx, feat_name in enumerate(feature_names):
-        beta_vec = np.array([coef[class_to_idx[c], feat_idx] if c in class_to_idx else 0.0 for c in classes])
-        for class_pos, mode in enumerate(classes):
+        beta_full = np.array([coef[i, feat_idx] for i in range(len(model_classes))])
+        weighted_beta = probs @ beta_full
+
+        for mode in classes:
             if mode not in class_to_idx:
                 continue
-            p_k = probs[:, class_pos]
-            beta_k = beta_vec[class_pos]
-            weighted_beta = probs @ beta_vec
+            col = class_to_idx[mode]
+            p_k = probs[:, col]
+            beta_k = coef[col, feat_idx]
             marginal = p_k * (beta_k - weighted_beta)
             ame[str(mode)][feat_name] = float(np.mean(marginal))
 
@@ -187,14 +189,15 @@ def _implied_arc_elasticities(
         if feat_name not in continuous_features:
             continue
         x_bar = max(x_means[feat_name], 1e-6)
-        beta_vec = np.array([coef[class_to_idx[c], feat_idx] if c in class_to_idx else 0.0 for c in classes])
-        for class_pos, mode in enumerate(classes):
+        beta_full = np.array([coef[i, feat_idx] for i in range(len(model_classes))])
+        weighted_beta = probs @ beta_full
+        for mode in classes:
             if mode not in class_to_idx:
                 continue
-            p_k = np.mean(probs[:, class_pos])
-            beta_k = beta_vec[class_pos]
-            weighted_beta = probs @ beta_vec
-            ame_k = float(np.mean(probs[:, class_pos] * (beta_k - weighted_beta)))
+            col = class_to_idx[mode]
+            p_k = np.mean(probs[:, col])
+            beta_k = coef[col, feat_idx]
+            ame_k = float(np.mean(probs[:, col] * (beta_k - weighted_beta)))
             if p_k <= 1e-8:
                 elasticities[str(mode)][feat_name] = 0.0
             else:
@@ -278,13 +281,10 @@ def evaluate_mnl_mode_choice_validation(
     elast_tstr_vec = _flatten_nested(elast_tstr, shared_classes, ("trip_time_num_6", "start_time_num_6"))
     elast_trtr_vec = _flatten_nested(elast_trtr, shared_classes, ("trip_time_num_6", "start_time_num_6"))
 
-    eval_classes = np.array(sorted(set(model_tstr.classes_).intersection(model_trtr.classes_).intersection(set(y_te))))
-    tstr_logloss = float(
-        log_loss(y_te, _predict_probabilities(model_tstr, scaler_tstr, X_te)[0], labels=eval_classes)
-    )
-    trtr_logloss = float(
-        log_loss(y_te, _predict_probabilities(model_trtr, scaler_trtr, X_te)[0], labels=eval_classes)
-    )
+    tstr_probs, tstr_classes = _predict_probabilities(model_tstr, scaler_tstr, X_te)
+    trtr_probs, trtr_classes = _predict_probabilities(model_trtr, scaler_trtr, X_te)
+    tstr_logloss = float(log_loss(y_te, tstr_probs, labels=tstr_classes))
+    trtr_logloss = float(log_loss(y_te, trtr_probs, labels=trtr_classes))
 
     coef_cosine = _cosine_similarity(coef_tstr, coef_trtr)
     coef_rmse = _rmse(coef_tstr, coef_trtr)

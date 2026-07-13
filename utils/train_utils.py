@@ -108,12 +108,58 @@ def _build_timestep_probs(T, t_sampling):
     return weights / weights.sum()
 
 
+def compute_joint_loss_from_marginals(logits, x0_batch, joint_pairs, features_info, mode="batch_stats"):
+    """
+    Joint supervision without explicit joint heads.
+
+    batch_stats: match batch-mean product-of-marginals to empirical co-occurrence counts.
+    product: per-sample CE on flattened p(x_i) * p(x_j).
+    """
+    if not joint_pairs:
+        device = x0_batch.device
+        return torch.tensor(0.0, device=device)
+
+    total = torch.tensor(0.0, device=x0_batch.device)
+    for feat_idx1, feat_idx2 in joint_pairs:
+        name1 = features_info[feat_idx1]["name"]
+        name2 = features_info[feat_idx2]["name"]
+        k1 = features_info[feat_idx1]["num_classes"]
+        k2 = features_info[feat_idx2]["num_classes"]
+
+        p1 = F.softmax(logits[name1], dim=-1)
+        p2 = F.softmax(logits[name2], dim=-1)
+
+        if mode == "product":
+            joint_probs = (p1.unsqueeze(2) * p2.unsqueeze(1)).reshape(-1, k1 * k2)
+            joint_log_probs = torch.log(joint_probs.clamp(min=1e-12))
+            target_joint = x0_batch[:, feat_idx1] * k2 + x0_batch[:, feat_idx2]
+            total = total + F.cross_entropy(joint_log_probs, target_joint)
+        elif mode == "batch_stats":
+            pred_joint = (p1.unsqueeze(2) * p2.unsqueeze(1)).mean(dim=0)
+            pred_joint = pred_joint / pred_joint.sum().clamp(min=1e-12)
+
+            flat_target = x0_batch[:, feat_idx1] * k2 + x0_batch[:, feat_idx2]
+            emp_joint = torch.bincount(flat_target, minlength=k1 * k2).float().view(k1, k2)
+            emp_joint = emp_joint / emp_joint.sum().clamp(min=1e-12)
+
+            total = total + F.kl_div(
+                torch.log(pred_joint.clamp(min=1e-12)),
+                emp_joint,
+                reduction="batchmean",
+            )
+        else:
+            raise ValueError(f"Unknown joint_loss_mode: {mode}")
+
+    return total / len(joint_pairs)
+
+
 def train_model(model, optimizer, dataset, features_info, 
                 lambda_weight, lambda_joint, T, epochs, batch_size, device,
                 loss_type='standard',causal_weight=None,
                 model_save_path=None, patience=10, min_delta=1e-4,
                 batch_sampling='sequential', sampling_feature='act_num',
-                sampling_power=1.0, t_sampling='uniform'):
+                sampling_power=1.0, t_sampling='uniform',
+                feature_loss_weights=None, joint_loss_mode='batch_stats'):
     """
     Model training process:
       - For each batch, do the diffusion process based on random step t.
@@ -147,6 +193,8 @@ def train_model(model, optimizer, dataset, features_info,
             sampling_feature=sampling_feature,
             sampling_power=sampling_power
         )
+
+    feature_loss_weights = feature_loss_weights or {}
 
     logger.info(
         "Sampling config: batch_sampling=%s, sampling_feature=%s, sampling_power=%.3f, t_sampling=%s",
@@ -275,10 +323,11 @@ def train_model(model, optimizer, dataset, features_info,
                 # 3) per‐feature losses
                 for feat_index, feat in enumerate(features_info):
                     name = feat["name"]
+                    feat_w = float(feature_loss_weights.get(name, 1.0))
                     # --- a) CE loss on x0
                     logits_x0 = logits[name]                          # (bsz, K)
                     target_x0 = x0_batch[:, feat_index]               # (bsz,)
-                    ce_loss += F.cross_entropy(logits_x0, target_x0)
+                    ce_loss += feat_w * F.cross_entropy(logits_x0, target_x0)
 
                     # --- b) VB-loss via predicted p(x_{t-1}|x_t)
                     # 1) compute p_theta(x0|xt)
@@ -304,26 +353,31 @@ def train_model(model, optimizer, dataset, features_info,
                     # 4) turn back into “logits” and cross-entropy against sampled x_{t-1}
                     logits_xtm1 = torch.log(probs_xtm1 + 1e-8)        # (bsz, K)
                     target_xtm1 = x_t_minus_1[:, feat_index]          # (bsz,)
-                    vb_loss += F.cross_entropy(logits_xtm1, target_xtm1)
-                ce_loss = ce_loss / len(features_info)
-                vb_loss = vb_loss / len(features_info)
+                    vb_loss += feat_w * F.cross_entropy(logits_xtm1, target_xtm1)
+                weight_sum = sum(float(feature_loss_weights.get(f["name"], 1.0)) for f in features_info)
+                ce_loss = ce_loss / max(weight_sum, 1e-8)
+                vb_loss = vb_loss / max(weight_sum, 1e-8)
 
                 # 4) joint losses for important feature pairs
                 joint_loss_val = 0.0
                 if len(attr_model.joint_pairs) > 0 and lambda_joint > 0:
-                    for idx, (feat_idx1, feat_idx2) in enumerate(attr_model.joint_pairs):
-                        K2 = features_info[feat_idx2]["num_classes"]
-                        # Create Joint Target Labels: label = val1 * K2 + val2
-                        # This converts the combination of two features into a unique integer ID
-                        target_1 = x0_batch[:, feat_idx1]
-                        target_2 = x0_batch[:, feat_idx2]
-                        target_joint = target_1 * K2 + target_2
-                        
-                        # Calculate Cross Entropy
-                        joint_loss_val += F.cross_entropy(joint_logits[idx], target_joint)
-                    
-                    # Average Joint Loss
-                    joint_loss_val = joint_loss_val / len(attr_model.joint_pairs)
+                    use_joint_heads = getattr(attr_model, "use_joint_heads", True) and bool(joint_logits)
+                    if use_joint_heads:
+                        for idx, (feat_idx1, feat_idx2) in enumerate(attr_model.joint_pairs):
+                            k2 = features_info[feat_idx2]["num_classes"]
+                            target_1 = x0_batch[:, feat_idx1]
+                            target_2 = x0_batch[:, feat_idx2]
+                            target_joint = target_1 * k2 + target_2
+                            joint_loss_val += F.cross_entropy(joint_logits[idx], target_joint)
+                        joint_loss_val = joint_loss_val / len(attr_model.joint_pairs)
+                    else:
+                        joint_loss_val = compute_joint_loss_from_marginals(
+                            logits,
+                            x0_batch,
+                            attr_model.joint_pairs,
+                            features_info,
+                            mode=joint_loss_mode,
+                        )
 
 
                 loss = vb_loss + lambda_weight * ce_loss + lambda_joint * joint_loss_val
@@ -446,11 +500,77 @@ def sample_trip(model, cond_tensor,device):
 
     return x_t[0]
 
-def fast_sample_trips(model, cond_batch, device):
+def _apply_joint_pair_gibbs(
+    x_prev,
+    feat_idx_map,
+    features_info,
+    gibbs_iters=3,
+    joint_logits=None,
+    joint_head_pairs=None,
+    logits=None,
+    joint_pairs=None,
+):
+    """
+    Refine sampled trip tokens via Gibbs updates on feature pairs.
+
+    Uses explicit joint heads when provided; otherwise falls back to the
+    product of marginal logits from the transformer.
+    """
+    has_head_pairs = joint_logits and joint_head_pairs
+    has_marginal_pairs = logits is not None and joint_pairs
+    if gibbs_iters <= 0 or (not has_head_pairs and not has_marginal_pairs):
+        return x_prev
+
+    name_to_k = {f["name"]: f["num_classes"] for f in features_info}
+    x_refined = x_prev.clone()
+
+    for _ in range(gibbs_iters):
+        if has_head_pairs:
+            pair_specs = list(enumerate(joint_head_pairs))
+        else:
+            pair_specs = list(enumerate(joint_pairs))
+
+        for pair_idx, pair_spec in pair_specs:
+            if has_head_pairs:
+                name1, name2 = pair_spec
+                idx1 = feat_idx_map[name1]
+                idx2 = feat_idx_map[name2]
+                k2 = name_to_k[name2]
+                joint_probs = F.softmax(joint_logits[pair_idx], dim=1)
+            else:
+                feat_idx1, feat_idx2 = pair_spec
+                name1 = features_info[feat_idx1]["name"]
+                name2 = features_info[feat_idx2]["name"]
+                idx1 = feat_idx_map[name1]
+                idx2 = feat_idx_map[name2]
+                k2 = name_to_k[name2]
+                p1 = F.softmax(logits[name1], dim=1)
+                p2 = F.softmax(logits[name2], dim=1)
+                joint_probs = (p1.unsqueeze(2) * p2.unsqueeze(1)).reshape(x_prev.size(0), -1)
+
+            flat_idx = torch.multinomial(joint_probs, num_samples=1).squeeze(1)
+            x_refined[:, idx1] = torch.div(flat_idx, k2, rounding_mode="floor")
+            x_refined[:, idx2] = flat_idx % k2
+
+    return x_refined
+
+
+def fast_sample_trips(
+    model,
+    cond_batch,
+    device,
+    use_joint_sampling=False,
+    joint_sample_steps=None,
+    joint_gibbs_iters=3,
+):
     """
     Batch sampling: Generates multiple trips in parallel.
     cond_batch: Tensor of shape (Batch_Size, Num_Cond_Features)
     """
+    if joint_sample_steps is None:
+        joint_sample_steps = {1}
+    else:
+        joint_sample_steps = set(joint_sample_steps)
     if hasattr(model, 'module'):
         attr_model = model.module
     else:
@@ -482,9 +602,10 @@ def fast_sample_trips(model, cond_batch, device):
             # Note: If your model forward returns (logits, joint_logits), unpack here
             model_output = model(x_t, cond_batch, t_batch)
             if isinstance(model_output, tuple):
-                logits, _ = model_output # Ignore joint_logits
+                logits, joint_logits = model_output
             else:
                 logits = model_output
+                joint_logits = None
 
             # 3. Sample each feature
             x_prev_list = []
@@ -540,6 +661,24 @@ def fast_sample_trips(model, cond_batch, device):
             # Update x_t
             x_t = torch.stack(x_prev_list, dim=1) # (B, Num_Features)
 
+            if use_joint_sampling and t in joint_sample_steps and len(getattr(attr_model, "joint_pairs", [])) > 0:
+                if t != 1:
+                    logging.warning(
+                        "Joint pair sampling at t=%d is approximate; only t=1 is theoretically exact.",
+                        t,
+                    )
+                use_joint_heads = getattr(attr_model, "use_joint_heads", True) and bool(joint_logits)
+                x_t = _apply_joint_pair_gibbs(
+                    x_t,
+                    attr_model.feat_idx_map,
+                    attr_model.features_info,
+                    gibbs_iters=joint_gibbs_iters,
+                    joint_logits=joint_logits if use_joint_heads else None,
+                    joint_head_pairs=getattr(attr_model, "joint_head_pairs", None) if use_joint_heads else None,
+                    logits=logits if not use_joint_heads else None,
+                    joint_pairs=attr_model.joint_pairs if not use_joint_heads else None,
+                )
+
     # Convert residual mask tokens back to valid class ids for evaluation/export.
     if mask_token_ids is not None:
         for feat_index, feat in enumerate(attr_model.features_info):
@@ -555,7 +694,16 @@ def fast_sample_trips(model, cond_batch, device):
 
     return x_t
 
-def sample_trip(model, df, num_samples=0, device=None, match_test_one_to_one=True):
+def sample_trip(
+    model,
+    df,
+    num_samples=0,
+    device=None,
+    match_test_one_to_one=True,
+    use_joint_sampling=False,
+    joint_sample_steps=None,
+    joint_gibbs_iters=3,
+):
     """
     Generate conditional trip samples.
 
@@ -567,6 +715,9 @@ def sample_trip(model, df, num_samples=0, device=None, match_test_one_to_one=Tru
         device: Torch device
         match_test_one_to_one: If True, iterate over every row in df in order and
             generate one synthetic trip per test condition (1:1 with test set).
+        use_joint_sampling: If True, refine paired features with joint heads at inference.
+        joint_sample_steps: Reverse-diffusion timesteps where joint Gibbs is applied.
+        joint_gibbs_iters: Number of Gibbs sweeps over all joint pairs.
     """
     if hasattr(model, 'module'):
         attr_model = model.module
@@ -608,7 +759,14 @@ def sample_trip(model, df, num_samples=0, device=None, match_test_one_to_one=Tru
     for i in tqdm(range(0, num_samples, MAX_BATCH_SIZE), desc="Generating trips"):
         batch_cond = all_conds_tensor[i : i + MAX_BATCH_SIZE]
 
-        batch_generated = fast_sample_trips(model, batch_cond, device)
+        batch_generated = fast_sample_trips(
+            model,
+            batch_cond,
+            device,
+            use_joint_sampling=use_joint_sampling,
+            joint_sample_steps=joint_sample_steps,
+            joint_gibbs_iters=joint_gibbs_iters,
+        )
 
         generated_trips_list.append(batch_generated.cpu())
 

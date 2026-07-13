@@ -1,6 +1,38 @@
 import torch
 import torch.nn as nn
 
+# Ordered ST sub-chains within the ST stream (loc then time).
+ST_LOC_CHAIN_NAMES = ["start_type", "start_zcode_num", "end_type", "end_zcode_num"]
+ST_TIME_CHAIN_NAMES = ["start_time_num_6", "trip_time_num_6"]
+
+
+class _CascadeTokenStep(nn.Module):
+    """Update one token from causal predecessors + global context."""
+
+    def __init__(self, d_model, nhead, dropout=0.2):
+        super().__init__()
+        self.self_attn = nn.MultiheadAttention(d_model, nhead, batch_first=True, dropout=dropout)
+        self.cross_attn = nn.MultiheadAttention(d_model, nhead, batch_first=True, dropout=dropout)
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, d_model * 4),
+            nn.GELU(),
+            nn.Linear(d_model * 4, d_model),
+        )
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.norm3 = nn.LayerNorm(d_model)
+
+    def forward(self, x, ctx):
+        res = x
+        x1, _ = self.self_attn(x, x, x)
+        x = self.norm1(res + x1)
+
+        res = x
+        x2, _ = self.cross_attn(query=x, key=ctx, value=ctx)
+        x = self.norm2(res + x2)
+
+        return self.norm3(x + self.ffn(x))
+
 
 class SoftCausalAdapterBlock(nn.Module):
     """
@@ -11,8 +43,12 @@ class SoftCausalAdapterBlock(nn.Module):
     Global shared feature tokens are always available in each stream.
     """
 
-    def __init__(self, d_model, nhead, dropout=0.2):
+    def __init__(self, d_model, nhead, dropout=0.2, gate_init=None, st_cascade=False, st_loc_chain_idx=None, st_time_chain_idx=None):
         super().__init__()
+        gate_init = gate_init or {}
+        self.st_cascade = st_cascade
+        self.st_loc_chain_idx = st_loc_chain_idx or []
+        self.st_time_chain_idx = st_time_chain_idx or []
         self.act_self = nn.MultiheadAttention(d_model, nhead, batch_first=True, dropout=dropout)
         self.st_self = nn.MultiheadAttention(d_model, nhead, batch_first=True, dropout=dropout)
         self.mode_self = nn.MultiheadAttention(d_model, nhead, batch_first=True, dropout=dropout)
@@ -48,9 +84,36 @@ class SoftCausalAdapterBlock(nn.Module):
         self.mode_norm3 = nn.LayerNorm(d_model)
 
         # Start close to identity, then let training learn causal strength.
-        self.gate_act = nn.Parameter(torch.tensor(-1.0))
-        self.gate_st = nn.Parameter(torch.tensor(-1.0))
-        self.gate_mode = nn.Parameter(torch.tensor(-1.0))
+        self.gate_act = nn.Parameter(torch.tensor(float(gate_init.get("act", -1.0))))
+        self.gate_st = nn.Parameter(torch.tensor(float(gate_init.get("st", -1.0))))
+        self.gate_mode = nn.Parameter(torch.tensor(float(gate_init.get("mode", -1.0))))
+
+        if self.st_cascade:
+            self.loc_cascade_steps = nn.ModuleList(
+                [_CascadeTokenStep(d_model, nhead, dropout=dropout) for _ in self.st_loc_chain_idx]
+            )
+            self.time_cascade_steps = nn.ModuleList(
+                [_CascadeTokenStep(d_model, nhead, dropout=dropout) for _ in self.st_time_chain_idx]
+            )
+
+    def _update_st_cascade(self, h_st, st_ctx):
+        h_st_new = h_st.clone()
+
+        loc_ctx = st_ctx
+        for step_idx, st_idx in enumerate(self.st_loc_chain_idx):
+            token = h_st[:, st_idx : st_idx + 1, :]
+            token_new = self.loc_cascade_steps[step_idx](token, loc_ctx)
+            h_st_new[:, st_idx : st_idx + 1, :] = token_new
+            loc_ctx = torch.cat([loc_ctx, token_new], dim=1)
+
+        time_ctx = torch.cat([st_ctx, h_st_new[:, self.st_loc_chain_idx, :]], dim=1)
+        for step_idx, st_idx in enumerate(self.st_time_chain_idx):
+            token = h_st[:, st_idx : st_idx + 1, :]
+            token_new = self.time_cascade_steps[step_idx](token, time_ctx)
+            h_st_new[:, st_idx : st_idx + 1, :] = token_new
+            time_ctx = torch.cat([time_ctx, token_new], dim=1)
+
+        return h_st_new
 
     def _update_stream(self, x, self_attn, cross_attn, ffn, norm1, norm2, norm3, ctx):
         res = x
@@ -76,9 +139,12 @@ class SoftCausalAdapterBlock(nn.Module):
         act_new = self._update_stream(
             h_act, self.act_self, self.act_cross, self.act_ffn, self.act_norm1, self.act_norm2, self.act_norm3, act_ctx
         )
-        st_new = self._update_stream(
-            h_st, self.st_self, self.st_cross, self.st_ffn, self.st_norm1, self.st_norm2, self.st_norm3, st_ctx
-        )
+        if self.st_cascade:
+            st_new = self._update_st_cascade(h_st, st_ctx)
+        else:
+            st_new = self._update_stream(
+                h_st, self.st_self, self.st_cross, self.st_ffn, self.st_norm1, self.st_norm2, self.st_norm3, st_ctx
+            )
         mode_new = self._update_stream(
             h_mode, self.mode_self, self.mode_cross, self.mode_ffn, self.mode_norm1, self.mode_norm2, self.mode_norm3, mode_ctx
         )
@@ -90,12 +156,27 @@ class SoftCausalAdapterBlock(nn.Module):
 
 
 class TripDiffusionModel(nn.Module):
-    def __init__(self, features_info, cond_info, T, joint_pairs=None):
+    def __init__(
+        self,
+        features_info,
+        cond_info,
+        T,
+        joint_pairs=None,
+        gate_init=None,
+        st_cascade=False,
+        use_joint_heads=True,
+        d_model=128,
+        shared_layers=2,
+        causal_layers=2,
+    ):
         super().__init__()
+        gate_init = gate_init or {}
         self.features_info = features_info
         self.cond_info = cond_info
         self.T = T
         self.joint_pairs = joint_pairs if joint_pairs is not None else []
+        self.st_cascade = st_cascade
+        self.use_joint_heads = use_joint_heads
 
         # Keep group definitions for compatibility with causal loss path.
         self.group_act_names = ["act_num"]
@@ -106,10 +187,10 @@ class TripDiffusionModel(nn.Module):
             if f["name"] not in self.group_act_names and f["name"] not in self.group_mode_names
         ]
 
-        self.d_model = 128
-        self.nhead = 4
-        self.shared_layers = 2
-        self.causal_layers = 2
+        self.d_model = d_model
+        self.nhead = max(1, d_model // 32)
+        self.shared_layers = shared_layers
+        self.causal_layers = causal_layers
         self.dropout = 0.2
 
         self.feat_names = [f["name"] for f in features_info]
@@ -117,6 +198,10 @@ class TripDiffusionModel(nn.Module):
         self.group_act_idx = [self.feat_idx_map[n] for n in self.group_act_names]
         self.group_st_idx = [self.feat_idx_map[n] for n in self.group_st_names]
         self.group_mode_idx = [self.feat_idx_map[n] for n in self.group_mode_names]
+
+        st_name_to_pos = {name: i for i, name in enumerate(self.group_st_names)}
+        self.st_loc_chain_idx = [st_name_to_pos[n] for n in ST_LOC_CHAIN_NAMES]
+        self.st_time_chain_idx = [st_name_to_pos[n] for n in ST_TIME_CHAIN_NAMES]
 
         self.feature_embeddings = nn.ModuleDict()
         for feat in features_info:
@@ -139,7 +224,18 @@ class TripDiffusionModel(nn.Module):
         )
         self.shared_encoder = nn.TransformerEncoder(shared_layer, num_layers=self.shared_layers)
         self.causal_adapters = nn.ModuleList(
-            [SoftCausalAdapterBlock(self.d_model, self.nhead, dropout=self.dropout) for _ in range(self.causal_layers)]
+            [
+                SoftCausalAdapterBlock(
+                    self.d_model,
+                    self.nhead,
+                    dropout=self.dropout,
+                    gate_init=gate_init,
+                    st_cascade=st_cascade,
+                    st_loc_chain_idx=self.st_loc_chain_idx,
+                    st_time_chain_idx=self.st_time_chain_idx,
+                )
+                for _ in range(self.causal_layers)
+            ]
         )
 
         self.output_heads = nn.ModuleDict()
@@ -148,12 +244,13 @@ class TripDiffusionModel(nn.Module):
 
         self.joint_heads = nn.ModuleList()
         self.joint_head_pairs = []
-        for idx1, idx2 in self.joint_pairs:
-            feat1 = features_info[idx1]
-            feat2 = features_info[idx2]
-            joint_dim = feat1["num_classes"] * feat2["num_classes"]
-            self.joint_heads.append(nn.Linear(self.d_model * 2, joint_dim))
-            self.joint_head_pairs.append((feat1["name"], feat2["name"]))
+        if self.use_joint_heads:
+            for idx1, idx2 in self.joint_pairs:
+                feat1 = features_info[idx1]
+                feat2 = features_info[idx2]
+                joint_dim = feat1["num_classes"] * feat2["num_classes"]
+                self.joint_heads.append(nn.Linear(self.d_model * 2, joint_dim))
+                self.joint_head_pairs.append((feat1["name"], feat2["name"]))
 
         # Diffusion schedule
         beta_schedule = torch.linspace(0.1, 0.5, steps=T)
@@ -281,8 +378,9 @@ class TripDiffusionModel(nn.Module):
             logits[name] = self.output_heads[name](hidden_state_map[name])
 
         joint_logits = []
-        for i, (name1, name2) in enumerate(self.joint_head_pairs):
-            h_pair = torch.cat([hidden_state_map[name1], hidden_state_map[name2]], dim=1)
-            joint_logits.append(self.joint_heads[i](h_pair))
+        if self.use_joint_heads:
+            for i, (name1, name2) in enumerate(self.joint_head_pairs):
+                h_pair = torch.cat([hidden_state_map[name1], hidden_state_map[name2]], dim=1)
+                joint_logits.append(self.joint_heads[i](h_pair))
 
         return logits, joint_logits
