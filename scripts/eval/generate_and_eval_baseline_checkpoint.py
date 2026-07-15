@@ -230,9 +230,13 @@ def generate_and_evaluate(
         generated_df = pd.read_csv(gene_csv)
         generated_df = _sanitize_df_by_schema(generated_df, FULL_SCHEMA)
 
+    # Feature-index order MUST match FEATURES_INFO (HCD revision order).
+    # TRIP_COLUMNS from tabular baselines uses a different column order and would
+    # mis-assign per-feature JSD / mean_marginal_jsd if used here.
+    eval_trip_cols = [f["name"] for f in FEATURES_INFO]
     truth_df = test_df.reset_index(drop=True)
-    truth_trips = truth_df[TRIP_COLUMNS].values.tolist()
-    generated_trips = generated_df[TRIP_COLUMNS].values.tolist()
+    truth_trips = truth_df[eval_trip_cols].astype(int).values.tolist()
+    generated_trips = generated_df[eval_trip_cols].astype(int).values.tolist()
 
     generated_samples = None
     if model_name == "ddpm_tf":

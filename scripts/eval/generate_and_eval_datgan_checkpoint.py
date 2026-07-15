@@ -1,8 +1,9 @@
-"""Generate and evaluate from a saved TVAE (SDV) checkpoint."""
+"""Generate and evaluate from a saved DATGAN model directory."""
 
 import argparse
 import json
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -21,28 +22,78 @@ from scripts.baselines.run_tabular_baselines import (
     ALL_COLUMNS,
     FULL_SCHEMA,
     TRIP_COLUMNS,
+    _build_datgan_metadata,
+    _filter_kwargs,
+    _import_datgan_class,
+    _resolve_datgan_dag,
+    _sample_model,
     _sanitize_df_by_schema,
 )
 
 
-def _load_tvae_checkpoint(checkpoint: str):
-    """Load SDV TVAE pickle, patching faker Provider attrs removed in newer faker."""
-    import uuid
+def _load_datgan_from_dir(model_dir: str, train_data: str, dag_mode: str = "cascade", continuous_time: bool = True):
+    datgan_class = _import_datgan_class()
+    from datgan.synthesizer.synthesizer import Synthesizer
+    from datgan.utils.dag import get_order_variables, transform_dag, verify_dag
+    output = os.path.join(model_dir, "")
+    init_kwargs = _filter_kwargs(
+        datgan_class,
+        {
+            "name": "datgan_eval",
+            "output": output,
+            "restore_session": True,
+            "save_checkpoints": False,
+            "verbose": 0,
+        },
+    )
+    model = datgan_class(**init_kwargs)
+    train_df = pd.read_csv(train_data, nrows=1000)[ALL_COLUMNS]
+    metadata = _build_datgan_metadata(continuous_time=continuous_time)
+    dag = _resolve_datgan_dag(dag_mode)
+    encoded_path = os.path.join(model_dir, "encoded_data")
 
-    import faker.providers.misc as misc
+    model.preprocess(train_df, metadata, encoded_path)
+    model.metadata = model.encoded_data.metadata
+    model.dag = transform_dag(dag, model.conditional_inputs)
+    verify_dag(train_df, model.dag)
+    model.var_order, model.n_sources = get_order_variables(model.dag)
+    model._DATGAN__default_parameter_values(train_df)
 
-    for name in ("uuid1", "uuid3", "uuid4", "uuid5", "uuid6", "uuid7", "uuid8"):
-        if not hasattr(misc.Provider, name):
-            setattr(misc.Provider, name, lambda self, n=name: getattr(uuid, n)())
-
-    from sdv.single_table import TVAESynthesizer
-
-    return TVAESynthesizer.load(checkpoint)
+    model.synthesizer = Synthesizer(
+        model.output,
+        model.metadata,
+        model.dag,
+        model.batch_size,
+        model.z_dim,
+        model.noise,
+        model.learning_rate,
+        model.g_period,
+        model.l2_reg,
+        model.num_gen_rnn,
+        model.num_gen_hidden,
+        model.num_dis_layers,
+        model.num_dis_hidden,
+        model.label_smoothing,
+        model.loss_function,
+        model.var_order,
+        model.n_sources,
+        model.conditional_inputs,
+        model.save_checkpoints,
+        model.restore_session,
+        model.verbose,
+    )
+    model.synthesizer.initialize()
+    return model
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Sample from saved TVAE checkpoint and evaluate.")
-    parser.add_argument("--checkpoint", type=str, required=True, help="Path to TVAE_model.pkl")
+    parser = argparse.ArgumentParser(description="Sample from saved DATGAN checkpoint dir and evaluate.")
+    parser.add_argument(
+        "--checkpoint_dir",
+        type=str,
+        required=True,
+        help="Path to DATGAN_model directory (contains checkpoints/).",
+    )
     parser.add_argument("--output_dir", type=str, required=True, help="Directory for gene.csv and metrics.json")
     parser.add_argument("--num_samples", type=int, default=534445)
     parser.add_argument("--sample_batch_size", type=int, default=5000)
@@ -52,7 +103,7 @@ def main() -> None:
     parser.add_argument(
         "--eval_only",
         action="store_true",
-        help="Skip generation; evaluate existing TVAE_gene.csv in output_dir.",
+        help="Skip generation; evaluate existing DATGAN_gene.csv in output_dir.",
     )
     args = parser.parse_args()
 
@@ -64,14 +115,21 @@ def main() -> None:
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    gene_csv = output_dir / "TVAE_gene.csv"
-    metrics_json = output_dir / "TVAE_metrics.json"
+    gene_csv = output_dir / "DATGAN_gene.csv"
+    metrics_json = output_dir / "DATGAN_metrics.json"
 
     if not args.eval_only:
-        logging.info("Loading TVAE checkpoint: %s", args.checkpoint)
-        synthesizer = _load_tvae_checkpoint(args.checkpoint)
-        logging.info("Generating %d samples (batch_size=%d)...", args.num_samples, args.sample_batch_size)
-        generated_df = synthesizer.sample(num_rows=args.num_samples, batch_size=args.sample_batch_size)
+        logging.info("Loading DATGAN from: %s", args.checkpoint_dir)
+        model = _load_datgan_from_dir(args.checkpoint_dir, args.train_data)
+        chunks = []
+        remaining = args.num_samples
+        while remaining > 0:
+            bsz = min(args.sample_batch_size, remaining)
+            logging.info("Generating batch of %d (%d remaining)...", bsz, remaining)
+            chunk = _sample_model(model, bsz, ALL_COLUMNS)
+            chunks.append(chunk)
+            remaining -= bsz
+        generated_df = pd.concat(chunks, ignore_index=True)
         generated_df = _sanitize_df_by_schema(generated_df, FULL_SCHEMA)
         generated_df[ALL_COLUMNS].to_csv(gene_csv, index=False)
         logging.info("Saved generated CSV: %s", gene_csv)
@@ -116,14 +174,14 @@ def main() -> None:
         "seed": args.seed,
         "num_samples": args.num_samples,
         "eval_sampling": "unconditional_full_test_reference",
-        "checkpoint": str(args.checkpoint),
+        "checkpoint_dir": str(args.checkpoint_dir),
         "evaluation": metrics,
     }
     with open(metrics_json, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
     logging.info("Saved metrics JSON: %s", metrics_json)
     logging.info(
-        "TVAE | joint_js=%.6f | marginal_jsd=%.6f | LVR=%.4f | MNL sim=%s",
+        "DATGAN | joint_js=%.6f | marginal_jsd=%.6f | LVR=%.4f | MNL sim=%s",
         metrics.get("joint_js", float("nan")),
         metrics.get("mean_marginal_jsd", float("nan")),
         metrics.get("logical_validity_rate", float("nan")),

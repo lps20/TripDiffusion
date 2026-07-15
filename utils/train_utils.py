@@ -159,12 +159,15 @@ def train_model(model, optimizer, dataset, features_info,
                 model_save_path=None, patience=10, min_delta=1e-4,
                 batch_sampling='sequential', sampling_feature='act_num',
                 sampling_power=1.0, t_sampling='uniform',
-                feature_loss_weights=None, joint_loss_mode='batch_stats'):
+                feature_loss_weights=None, joint_loss_mode='batch_stats',
+                start_epoch=0, initial_best_loss=None):
     """
     Model training process:
       - For each batch, do the diffusion process based on random step t.
       - Forword propagate and compute the entropy loss (CE loss and VB loss).
       - Backpropagate and update the model parameters.
+      - start_epoch: 0-based epoch index already completed (resume); loops start_epoch..epochs-1.
+      - initial_best_loss: warm-start early-stopping baseline when resuming from a checkpoint.
     """
     logger = logging.getLogger(__name__)
     
@@ -176,8 +179,16 @@ def train_model(model, optimizer, dataset, features_info,
     model.train()
 
     # --- Early Stopping Variables ---
-    best_loss = float('inf')
+    best_loss = float("inf") if initial_best_loss is None else float(initial_best_loss)
     patience_counter = 0
+    start_epoch = max(0, int(start_epoch))
+    if start_epoch >= epochs:
+        logger.info(
+            "Resume start_epoch=%d >= epochs=%d; skipping training loop.",
+            start_epoch,
+            epochs,
+        )
+        return
 
     valid_batch_sampling = {'sequential', 'shuffle', 'balanced'}
     if batch_sampling not in valid_batch_sampling:
@@ -202,7 +213,14 @@ def train_model(model, optimizer, dataset, features_info,
     )
 
     num_samples = len(dataset)
-    for epoch in range(epochs):
+    if start_epoch > 0:
+        logger.info(
+            "Resuming training from epoch %d/%d (already completed %d)",
+            start_epoch + 1,
+            epochs,
+            start_epoch,
+        )
+    for epoch in range(start_epoch, epochs):
         total_loss = 0.0
 
         pbar = tqdm(range(0, num_samples, batch_size), desc=f"Epoch {epoch+1}/{epochs}", leave=False)

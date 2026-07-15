@@ -80,7 +80,7 @@ def _default_cond_info():
     ]
 
 
-def _configure_logging(exp_dir):
+def _configure_logging(exp_dir, append=False):
     log_file = os.path.join(exp_dir, "training.log")
     logger = logging.getLogger()
     logger.setLevel(logging.INFO)
@@ -88,7 +88,7 @@ def _configure_logging(exp_dir):
         logger.handlers.clear()
 
     formatter = logging.Formatter("%(asctime)s %(levelname)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
-    fh = logging.FileHandler(log_file, mode="w")
+    fh = logging.FileHandler(log_file, mode="a" if append else "w")
     fh.setLevel(logging.INFO)
     fh.setFormatter(formatter)
     logger.addHandler(fh)
@@ -102,7 +102,8 @@ def _configure_logging(exp_dir):
 
 def run_once(args, seed, exp_dir):
     os.makedirs(exp_dir, exist_ok=True)
-    _configure_logging(exp_dir)
+    resume_epoch = int(getattr(args, "resume_epoch", 0) or 0)
+    _configure_logging(exp_dir, append=(resume_epoch > 0 and bool(args.checkpoint)))
 
     model_file = os.path.join(exp_dir, "model.pth")
     generation_file = os.path.join(exp_dir, "generated_samples.csv")
@@ -218,6 +219,8 @@ def run_once(args, seed, exp_dir):
             t_sampling=args.t_sampling,
             feature_loss_weights=feature_loss_weights,
             joint_loss_mode=args.joint_loss_mode,
+            start_epoch=resume_epoch,
+            initial_best_loss=getattr(args, "resume_best_loss", None),
         )
     else:
         logging.info("Evaluation only mode. Skipping training.")
@@ -390,6 +393,19 @@ if __name__ == "__main__":
     )
     parser.add_argument("--checkpoint", type=str, default=None, help="Path to pre-trained model.pth")
     parser.add_argument("--eval_only", action="store_true", help="Set this flag to skip training and only evaluate")
+    parser.add_argument(
+        "--resume_epoch",
+        type=int,
+        default=0,
+        help="Number of epochs already completed when resuming from --checkpoint (0-based completed count). "
+        "Training continues from resume_epoch+1 through --epochs.",
+    )
+    parser.add_argument(
+        "--resume_best_loss",
+        type=float,
+        default=None,
+        help="Best train loss observed before resume (for early-stopping continuity).",
+    )
     parser.add_argument(
         "--no_joint_heads",
         action="store_true",
