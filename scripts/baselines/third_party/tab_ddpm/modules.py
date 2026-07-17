@@ -423,11 +423,12 @@ class ResNet(nn.Module):
 #### For diffusion 
 
 class MLPDiffusion(nn.Module):
-    def __init__(self, d_in, num_classes, is_y_cond, rtdl_params, dim_t = 128):
+    def __init__(self, d_in, num_classes, is_y_cond, rtdl_params, dim_t = 128, cond_dim: int = 0):
         super().__init__()
         self.dim_t = dim_t
         self.num_classes = num_classes
         self.is_y_cond = is_y_cond
+        self.cond_dim = int(cond_dim) if cond_dim else 0
 
         # d0 = rtdl_params['d_layers'][0]
 
@@ -438,8 +439,8 @@ class MLPDiffusion(nn.Module):
 
         if self.num_classes > 0 and is_y_cond:
             self.label_emb = nn.Embedding(self.num_classes, dim_t)
-        elif self.num_classes == 0 and is_y_cond:
-            self.label_emb = nn.Linear(1, dim_t)
+        elif is_y_cond:
+            self.label_emb = nn.Linear(max(self.cond_dim, 1), dim_t)
         
         self.proj = nn.Linear(d_in, dim_t)
         self.time_embed = nn.Sequential(
@@ -453,11 +454,76 @@ class MLPDiffusion(nn.Module):
         if self.is_y_cond and y is not None:
             if self.num_classes > 0:
                 y = y.squeeze()
+                emb = emb + F.silu(self.label_emb(y))
             else:
-                y = y.resize(y.size(0), 1).float()
-            emb += F.silu(self.label_emb(y))
+                if y.dim() == 1:
+                    y = y.view(-1, 1)
+                emb = emb + F.silu(self.label_emb(y.float()))
         x = self.proj(x) + emb
         return self.mlp(x)
+
+
+class TransformerDiffusion(nn.Module):
+    """Flat-input Transformer denoiser with the same (x, t, y) interface as MLPDiffusion."""
+
+    def __init__(
+        self,
+        d_in,
+        num_classes=0,
+        is_y_cond=False,
+        dim_t=128,
+        d_model=128,
+        nhead=8,
+        num_layers=4,
+        n_tokens=16,
+        dropout=0.0,
+        cond_dim: int = 0,
+    ):
+        super().__init__()
+        self.dim_t = dim_t
+        self.d_model = d_model
+        self.n_tokens = n_tokens
+        self.num_classes = num_classes
+        self.is_y_cond = is_y_cond
+        self.cond_dim = int(cond_dim) if cond_dim else 0
+
+        self.proj_in = nn.Linear(d_in, n_tokens * d_model)
+        self.proj_out = nn.Linear(n_tokens * d_model, d_in)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=d_model * 4,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.time_embed = nn.Sequential(
+            nn.Linear(dim_t, dim_t),
+            nn.SiLU(),
+            nn.Linear(dim_t, d_model),
+        )
+        if self.num_classes > 0 and is_y_cond:
+            self.label_emb = nn.Embedding(self.num_classes, d_model)
+        elif is_y_cond:
+            self.label_emb = nn.Linear(max(self.cond_dim, 1), d_model)
+
+    def forward(self, x, timesteps, y=None):
+        emb = self.time_embed(timestep_embedding(timesteps, self.dim_t))
+        if self.is_y_cond and y is not None:
+            if self.num_classes > 0:
+                y = y.squeeze()
+                emb = emb + F.silu(self.label_emb(y))
+            else:
+                if y.dim() == 1:
+                    y = y.view(-1, 1)
+                emb = emb + F.silu(self.label_emb(y.float()))
+        h = self.proj_in(x).view(x.size(0), self.n_tokens, self.d_model)
+        h = h + emb.unsqueeze(1)
+        h = self.encoder(h)
+        return self.proj_out(h.reshape(x.size(0), -1))
+
 
 class ResNetDiffusion(nn.Module):
     def __init__(self, d_in, num_classes, rtdl_params, dim_t = 256):

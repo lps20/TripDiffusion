@@ -156,7 +156,9 @@ def run_once(args, seed, exp_dir):
             "st": args.gate_init_st,
             "mode": args.gate_init_mode,
         },
+        freeze_gates=args.freeze_gates,
         st_cascade=args.st_cascade,
+        st_cascade_chain=args.st_cascade_chain,
         use_joint_heads=not args.no_joint_heads,
         d_model=d_model,
         shared_layers=shared_layers,
@@ -164,8 +166,25 @@ def run_once(args, seed, exp_dir):
     ).to(device)
     num_params = sum(p.numel() for p in model.parameters())
     logging.info("Model parameters: %d (%.2f M)", num_params, num_params / 1e6)
+    if args.freeze_gates:
+        import math as _math
+
+        logging.info(
+            "Gates FROZEN at init | act=%.3f (α≈%.3f) | st=%.3f (α≈%.3f) | mode=%.3f (α≈%.3f)",
+            args.gate_init_act,
+            1.0 / (1.0 + _math.exp(-args.gate_init_act)),
+            args.gate_init_st,
+            1.0 / (1.0 + _math.exp(-args.gate_init_st)),
+            args.gate_init_mode,
+            1.0 / (1.0 + _math.exp(-args.gate_init_mode)),
+        )
     if args.st_cascade:
-        logging.info("Using HCD v2 with ST loc/time cascade in causal adapters.")
+        logging.info(
+            "Using HCD v2 ST cascade chain=%s | phase1=%s | phase2=%s",
+            args.st_cascade_chain,
+            getattr(model, "st_cascade_phase1_names", None),
+            getattr(model, "st_cascade_phase2_names", None),
+        )
     else:
         logging.info("Using HCD v2: shared transformer + soft causal adapters.")
 
@@ -287,6 +306,11 @@ def run_once(args, seed, exp_dir):
         "joint_sample_steps": joint_sample_steps if args.joint_sampling_at_inference else None,
         "joint_gibbs_iters": int(args.joint_gibbs_iters) if args.joint_sampling_at_inference else None,
         "st_cascade": bool(args.st_cascade),
+        "st_cascade_chain": args.st_cascade_chain if args.st_cascade else None,
+        "freeze_gates": bool(args.freeze_gates),
+        "gate_init_act": float(args.gate_init_act),
+        "gate_init_st": float(args.gate_init_st),
+        "gate_init_mode": float(args.gate_init_mode),
         "use_joint_heads": not bool(args.no_joint_heads),
         "joint_loss_mode": args.joint_loss_mode if args.no_joint_heads else "joint_head",
         "d_model": int(d_model),
@@ -386,6 +410,11 @@ if __name__ == "__main__":
     parser.add_argument("--gate_init_st", type=float, default=-1.0, help="Initial raw gate for space-time stream.")
     parser.add_argument("--gate_init_mode", type=float, default=-1.0, help="Initial raw gate for mode stream.")
     parser.add_argument(
+        "--freeze_gates",
+        action="store_true",
+        help="Freeze soft-causal gates at gate_init (ablate learnable soft gating; α=sigmoid(init)).",
+    )
+    parser.add_argument(
         "--feature_loss_weights",
         type=str,
         default=None,
@@ -442,6 +471,20 @@ if __name__ == "__main__":
         "--st_cascade",
         action="store_true",
         help="Use ST loc/time mini-cascade inside causal adapters (Step B).",
+    )
+    parser.add_argument(
+        "--st_cascade_chain",
+        type=str,
+        default="loc_then_time",
+        choices=[
+            "loc_then_time",
+            "time_then_loc",
+            "end_first_loc",
+            "zcode_first",
+            "types_then_z",
+            "start_then_end",
+        ],
+        help="ST cascade token order preset (only used with --st_cascade).",
     )
     parser.add_argument("--metrics_file", type=str, default=None, help="Path to write metrics JSON (default: <exp_dir>/generated_samples_metrics.json)")
     add_multiseed_arguments(parser, default_num_seeds=5)

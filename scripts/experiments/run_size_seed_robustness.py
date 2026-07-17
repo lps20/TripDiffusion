@@ -333,7 +333,7 @@ def _run_tabular_baseline(
             "--ddpm_lambda_joint",
             "0.0",
             "--ddpm_t",
-            "10",
+            "100",
         ]
     )
     payload = _reeval_gene_csv(

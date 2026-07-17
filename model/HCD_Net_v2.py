@@ -5,6 +5,52 @@ import torch.nn as nn
 ST_LOC_CHAIN_NAMES = ["start_type", "start_zcode_num", "end_type", "end_zcode_num"]
 ST_TIME_CHAIN_NAMES = ["start_time_num_6", "trip_time_num_6"]
 
+# Preset two-phase cascades over ST tokens.
+# phase1 tokens are updated first; phase2 then conditions on finished phase1.
+ST_CASCADE_PRESETS = {
+    # Current default / paper st_cascade.
+    "loc_then_time": (ST_LOC_CHAIN_NAMES, ST_TIME_CHAIN_NAMES),
+    # Reverse phase order: schedule first, then location.
+    "time_then_loc": (ST_TIME_CHAIN_NAMES, ST_LOC_CHAIN_NAMES),
+    # Destination-first OD, then times.
+    "end_first_loc": (
+        ["end_type", "end_zcode_num", "start_type", "start_zcode_num"],
+        ST_TIME_CHAIN_NAMES,
+    ),
+    # Zone codes before land-use types.
+    "zcode_first": (
+        ["start_zcode_num", "end_zcode_num", "start_type", "end_type"],
+        ST_TIME_CHAIN_NAMES,
+    ),
+    # Types for both ends, then zones, then times.
+    "types_then_z": (
+        ["start_type", "end_type", "start_zcode_num", "end_zcode_num"],
+        ST_TIME_CHAIN_NAMES,
+    ),
+    # Single trip-order chain (no second phase).
+    "start_then_end": (
+        [
+            "start_type",
+            "start_zcode_num",
+            "start_time_num_6",
+            "end_type",
+            "end_zcode_num",
+            "trip_time_num_6",
+        ],
+        [],
+    ),
+}
+
+
+def resolve_st_cascade_phases(chain_name):
+    """Return (phase1_names, phase2_names) for a cascade preset."""
+    if chain_name not in ST_CASCADE_PRESETS:
+        raise ValueError(
+            f"Unknown st_cascade_chain={chain_name!r}. "
+            f"Choose from: {sorted(ST_CASCADE_PRESETS)}"
+        )
+    return ST_CASCADE_PRESETS[chain_name]
+
 
 class _CascadeTokenStep(nn.Module):
     """Update one token from causal predecessors + global context."""
@@ -84,11 +130,17 @@ class SoftCausalAdapterBlock(nn.Module):
         self.mode_norm3 = nn.LayerNorm(d_model)
 
         # Start close to identity, then let training learn causal strength.
+        # With freeze_gates=True these stay fixed (soft-causal on/off ablation).
         self.gate_act = nn.Parameter(torch.tensor(float(gate_init.get("act", -1.0))))
         self.gate_st = nn.Parameter(torch.tensor(float(gate_init.get("st", -1.0))))
         self.gate_mode = nn.Parameter(torch.tensor(float(gate_init.get("mode", -1.0))))
+        if bool(gate_init.get("freeze", False)):
+            self.gate_act.requires_grad_(False)
+            self.gate_st.requires_grad_(False)
+            self.gate_mode.requires_grad_(False)
 
         if self.st_cascade:
+            # Keep module names for backward-compatible checkpoints.
             self.loc_cascade_steps = nn.ModuleList(
                 [_CascadeTokenStep(d_model, nhead, dropout=dropout) for _ in self.st_loc_chain_idx]
             )
@@ -97,21 +149,26 @@ class SoftCausalAdapterBlock(nn.Module):
             )
 
     def _update_st_cascade(self, h_st, st_ctx):
+        """Two-phase ST token cascade: phase1 then phase2 (phase2 sees phase1)."""
         h_st_new = h_st.clone()
 
-        loc_ctx = st_ctx
+        phase1_ctx = st_ctx
         for step_idx, st_idx in enumerate(self.st_loc_chain_idx):
             token = h_st[:, st_idx : st_idx + 1, :]
-            token_new = self.loc_cascade_steps[step_idx](token, loc_ctx)
+            token_new = self.loc_cascade_steps[step_idx](token, phase1_ctx)
             h_st_new[:, st_idx : st_idx + 1, :] = token_new
-            loc_ctx = torch.cat([loc_ctx, token_new], dim=1)
+            phase1_ctx = torch.cat([phase1_ctx, token_new], dim=1)
 
-        time_ctx = torch.cat([st_ctx, h_st_new[:, self.st_loc_chain_idx, :]], dim=1)
-        for step_idx, st_idx in enumerate(self.st_time_chain_idx):
-            token = h_st[:, st_idx : st_idx + 1, :]
-            token_new = self.time_cascade_steps[step_idx](token, time_ctx)
-            h_st_new[:, st_idx : st_idx + 1, :] = token_new
-            time_ctx = torch.cat([time_ctx, token_new], dim=1)
+        if self.st_time_chain_idx:
+            if self.st_loc_chain_idx:
+                phase2_ctx = torch.cat([st_ctx, h_st_new[:, self.st_loc_chain_idx, :]], dim=1)
+            else:
+                phase2_ctx = st_ctx
+            for step_idx, st_idx in enumerate(self.st_time_chain_idx):
+                token = h_st[:, st_idx : st_idx + 1, :]
+                token_new = self.time_cascade_steps[step_idx](token, phase2_ctx)
+                h_st_new[:, st_idx : st_idx + 1, :] = token_new
+                phase2_ctx = torch.cat([phase2_ctx, token_new], dim=1)
 
         return h_st_new
 
@@ -163,20 +220,26 @@ class TripDiffusionModel(nn.Module):
         T,
         joint_pairs=None,
         gate_init=None,
+        freeze_gates=False,
         st_cascade=False,
+        st_cascade_chain="loc_then_time",
         use_joint_heads=True,
         d_model=128,
         shared_layers=2,
         causal_layers=2,
     ):
         super().__init__()
-        gate_init = gate_init or {}
+        gate_init = dict(gate_init or {})
+        if freeze_gates:
+            gate_init["freeze"] = True
         self.features_info = features_info
         self.cond_info = cond_info
         self.T = T
         self.joint_pairs = joint_pairs if joint_pairs is not None else []
         self.st_cascade = st_cascade
+        self.st_cascade_chain = st_cascade_chain if st_cascade else None
         self.use_joint_heads = use_joint_heads
+        self.freeze_gates = bool(freeze_gates)
 
         # Keep group definitions for compatibility with causal loss path.
         self.group_act_names = ["act_num"]
@@ -200,8 +263,18 @@ class TripDiffusionModel(nn.Module):
         self.group_mode_idx = [self.feat_idx_map[n] for n in self.group_mode_names]
 
         st_name_to_pos = {name: i for i, name in enumerate(self.group_st_names)}
-        self.st_loc_chain_idx = [st_name_to_pos[n] for n in ST_LOC_CHAIN_NAMES]
-        self.st_time_chain_idx = [st_name_to_pos[n] for n in ST_TIME_CHAIN_NAMES]
+        if st_cascade:
+            phase1_names, phase2_names = resolve_st_cascade_phases(st_cascade_chain)
+        else:
+            phase1_names, phase2_names = ST_LOC_CHAIN_NAMES, ST_TIME_CHAIN_NAMES
+        missing = [n for n in list(phase1_names) + list(phase2_names) if n not in st_name_to_pos]
+        if missing:
+            raise ValueError(f"Cascade chain refers to unknown ST features: {missing}")
+        # st_loc_chain_idx / st_time_chain_idx = phase1 / phase2 (names kept for checkpoints).
+        self.st_loc_chain_idx = [st_name_to_pos[n] for n in phase1_names]
+        self.st_time_chain_idx = [st_name_to_pos[n] for n in phase2_names]
+        self.st_cascade_phase1_names = list(phase1_names)
+        self.st_cascade_phase2_names = list(phase2_names)
 
         self.feature_embeddings = nn.ModuleDict()
         for feat in features_info:
@@ -333,6 +406,7 @@ class TripDiffusionModel(nn.Module):
                     "alpha_act": float(torch.sigmoid(gate_act)),
                     "alpha_st": float(torch.sigmoid(gate_st)),
                     "alpha_mode": float(torch.sigmoid(gate_mode)),
+                    "frozen": not bool(block.gate_act.requires_grad),
                 }
             )
         return gates

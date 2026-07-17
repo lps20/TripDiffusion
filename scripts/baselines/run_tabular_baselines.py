@@ -567,7 +567,9 @@ def _baseline_model_paths(output_dir: str, model_name: str) -> Dict[str, str]:
         "tvae": os.path.join(output_dir, f"{tag}_model.pkl"),
         "vae": os.path.join(output_dir, f"{tag}_model.pt"),
         "ddpm_tf": os.path.join(output_dir, f"{tag}_model.pth"),
+        "ddpm_mlp": os.path.join(output_dir, f"{tag}_model.pth"),
         "tabddpm": os.path.join(output_dir, f"{tag}_model.pth"),
+        "tabddpm_tf": os.path.join(output_dir, f"{tag}_model.pth"),
         "datgan_dir": os.path.join(output_dir, f"{tag}_model"),
     }
 
@@ -737,15 +739,16 @@ def _run_ddpm_transformer(
     seed: int,
     model_save_path: Optional[str] = None,
 ) -> pd.DataFrame:
+    """Continuous Embedding-DDPM with Transformer denoiser (not discrete D3PM)."""
+    del lambda_weight, lambda_joint  # unused; continuous MSE objective
     _set_seed(seed)
-    from model.Transformer_Net import TripDiffusionModel as DDPMTransformerModel
+    from model.EmbeddingDDPM_Net import EmbeddingDDPM, sample_embedding_ddpm, train_embedding_ddpm
 
     logging.info(
-        "DDPM-Transformer baseline: using ordinal Gaussian noise for continuous variables "
-        "(start_time_num_6, trip_time_num_6)."
+        "DDPM-Transformer = continuous Embedding-DDPM (Gaussian in embedding space, T=%d).",
+        T,
     )
 
-    # Keep feature order consistent with existing diffusion training/sampling pipeline.
     ddpm_features_info = [
         {"name": "start_type", "type": "categorical", "num_classes": 5},
         {"name": "start_zcode_num", "type": "categorical", "num_classes": 77},
@@ -753,7 +756,6 @@ def _run_ddpm_transformer(
         {"name": "mode_num", "type": "categorical", "num_classes": 9},
         {"name": "end_type", "type": "categorical", "num_classes": 5},
         {"name": "end_zcode_num", "type": "categorical", "num_classes": 77},
-        # Continuous variables use ordinal state with Gaussian transition noise in DDPM.
         {"name": "start_time_num_6", "type": "ordinal", "num_classes": 241},
         {"name": "trip_time_num_6", "type": "ordinal", "num_classes": 241},
     ]
@@ -763,67 +765,122 @@ def _run_ddpm_transformer(
         {"name": "age_code", "num_classes": 13},
         {"name": "job_type", "num_classes": 9},
     ]
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = DDPMTransformerModel(ddpm_features_info, ddpm_cond_info, T, joint_pairs=[]).to(device)
-    optimizer = optim.Adam(model.parameters(), lr=lr)
-
     feat_cols = [f["name"] for f in ddpm_features_info]
     cond_cols = [c["name"] for c in ddpm_cond_info]
-    dataset = []
-    for _, row in train_df.iterrows():
-        x0 = torch.tensor([int(round(float(row[c]))) for c in feat_cols], dtype=torch.long)
-        cond = torch.tensor([int(round(float(row[c]))) for c in cond_cols], dtype=torch.long)
-        dataset.append((x0, cond))
-    utils.train_utils.train_model(
-        model=model,
-        optimizer=optimizer,
-        dataset=dataset,
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = EmbeddingDDPM(
         features_info=ddpm_features_info,
-        lambda_weight=lambda_weight,
-        lambda_joint=lambda_joint,
+        cond_info=ddpm_cond_info,
         T=T,
+        d_model=128,
+        backbone="transformer",
+        nhead=8,
+        num_layers=4,
+        beta_schedule="cosine",
+    ).to(device)
+    n_params = sum(p.numel() for p in model.parameters())
+    logging.info("Embedding-DDPM (transformer) parameters: %d (%.2f M)", n_params, n_params / 1e6)
+
+    model = train_embedding_ddpm(
+        model=model,
+        train_df=train_df,
+        feat_cols=feat_cols,
+        cond_cols=cond_cols,
         epochs=epochs,
         batch_size=batch_size,
+        lr=lr,
         device=device,
-        loss_type="standard",
-        causal_weight=None,
         model_save_path=model_save_path,
-        patience=max(epochs, 1),
-        min_delta=0.0,
-        batch_sampling="shuffle",
-        sampling_feature="act_num",
-        sampling_power=1.0,
-        t_sampling="uniform",
     )
-    if model_save_path:
-        _save_ddpm_checkpoint(
-            model_save_path,
-            model=model,
-            features_info=ddpm_features_info,
-            cond_info=ddpm_cond_info,
-            T=T,
-        )
-
-    generated_samples, _ = utils.train_utils.sample_trip(
+    return sample_embedding_ddpm(
         model=model,
-        df=test_df,
-        num_samples=n_samples,
+        test_df=test_df,
+        feat_cols=feat_cols,
+        cond_cols=cond_cols,
+        n_samples=n_samples,
         device=device,
-        match_test_one_to_one=(n_samples is None or n_samples <= 0),
+        batch_size=max(batch_size, 512),
+        match_test_one_to_one=True,
     )
 
-    rows = []
-    ddpm_trip_cols = [f["name"] for f in ddpm_features_info]
-    ddpm_cond_cols = [c["name"] for c in ddpm_cond_info]
-    for sample in generated_samples:
-        row = {}
-        for i, c in enumerate(ddpm_cond_cols):
-            row[c] = int(sample["condition"][i])
-        for i, c in enumerate(ddpm_trip_cols):
-            row[c] = int(sample["trip"][i])
-        rows.append(row)
-    return pd.DataFrame(rows)
+
+def _run_ddpm_mlp(
+    train_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    n_samples: int,
+    epochs: int,
+    batch_size: int,
+    lr: float,
+    T: int,
+    lambda_weight: float,
+    lambda_joint: float,
+    seed: int,
+    model_save_path: Optional[str] = None,
+) -> pd.DataFrame:
+    """Continuous Embedding-DDPM with MLP denoiser."""
+    del lambda_weight, lambda_joint
+    _set_seed(seed)
+    from model.EmbeddingDDPM_Net import EmbeddingDDPM, sample_embedding_ddpm, train_embedding_ddpm
+
+    logging.info(
+        "DDPM-MLP = continuous Embedding-DDPM (Gaussian in embedding space, T=%d).",
+        T,
+    )
+
+    ddpm_features_info = [
+        {"name": "start_type", "type": "categorical", "num_classes": 5},
+        {"name": "start_zcode_num", "type": "categorical", "num_classes": 77},
+        {"name": "act_num", "type": "categorical", "num_classes": 9},
+        {"name": "mode_num", "type": "categorical", "num_classes": 9},
+        {"name": "end_type", "type": "categorical", "num_classes": 5},
+        {"name": "end_zcode_num", "type": "categorical", "num_classes": 77},
+        {"name": "start_time_num_6", "type": "ordinal", "num_classes": 241},
+        {"name": "trip_time_num_6", "type": "ordinal", "num_classes": 241},
+    ]
+    ddpm_cond_info = [
+        {"name": "relation", "num_classes": 5},
+        {"name": "sex", "num_classes": 2},
+        {"name": "age_code", "num_classes": 13},
+        {"name": "job_type", "num_classes": 9},
+    ]
+    feat_cols = [f["name"] for f in ddpm_features_info]
+    cond_cols = [c["name"] for c in ddpm_cond_info]
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = EmbeddingDDPM(
+        features_info=ddpm_features_info,
+        cond_info=ddpm_cond_info,
+        T=T,
+        d_model=128,
+        backbone="mlp",
+        mlp_hidden=[512, 512, 512],
+        beta_schedule="cosine",
+    ).to(device)
+    n_params = sum(p.numel() for p in model.parameters())
+    logging.info("Embedding-DDPM (mlp) parameters: %d (%.2f M)", n_params, n_params / 1e6)
+
+    model = train_embedding_ddpm(
+        model=model,
+        train_df=train_df,
+        feat_cols=feat_cols,
+        cond_cols=cond_cols,
+        epochs=epochs,
+        batch_size=batch_size,
+        lr=lr,
+        device=device,
+        model_save_path=model_save_path,
+    )
+    return sample_embedding_ddpm(
+        model=model,
+        test_df=test_df,
+        feat_cols=feat_cols,
+        cond_cols=cond_cols,
+        n_samples=n_samples,
+        device=device,
+        batch_size=max(batch_size, 512),
+        match_test_one_to_one=True,
+    )
 
 
 def _evaluate_and_save(
@@ -937,6 +994,32 @@ def _run_model_for_seed(
             seed=seed,
             model_save_path=model_paths["tabddpm"] if save_models else None,
             hidden_layers=args.tabddpm_hidden_layers,
+            backbone="mlp",
+            condition_columns=COND_COLUMNS if args.tabddpm_conditional else None,
+            sample_cond_df=test_df if args.tabddpm_conditional else None,
+        )
+    if model_name == "tabddpm_tf":
+        from tab_ddpm_baseline import run_tabddpm
+
+        return run_tabddpm(
+            train_df=train_df,
+            all_columns=ALL_COLUMNS,
+            time_columns=TIME_COLUMNS,
+            schema=FULL_SCHEMA,
+            n_samples=args.num_samples,
+            epochs=args.epochs,
+            batch_size=args.batch_size,
+            lr=args.lr,
+            num_timesteps=args.tabddpm_t,
+            seed=seed,
+            model_save_path=model_paths["tabddpm_tf"] if save_models else None,
+            backbone="transformer",
+            tf_d_model=args.tabddpm_tf_d_model,
+            tf_nhead=args.tabddpm_tf_nhead,
+            tf_layers=args.tabddpm_tf_layers,
+            tf_n_tokens=args.tabddpm_tf_n_tokens,
+            condition_columns=COND_COLUMNS,
+            sample_cond_df=test_df,
         )
     if model_name == "vae":
         return _run_vae(
@@ -964,6 +1047,20 @@ def _run_model_for_seed(
             lambda_joint=args.ddpm_lambda_joint,
             seed=seed,
             model_save_path=model_paths["ddpm_tf"] if save_models else None,
+        )
+    if model_name == "ddpm_mlp":
+        return _run_ddpm_mlp(
+            train_df=train_df,
+            test_df=test_df,
+            n_samples=args.num_samples,
+            epochs=args.epochs,
+            batch_size=args.batch_size,
+            lr=args.lr,
+            T=args.ddpm_t,
+            lambda_weight=args.ddpm_lambda_weight,
+            lambda_joint=args.ddpm_lambda_joint,
+            seed=seed,
+            model_save_path=model_paths["ddpm_mlp"] if save_models else None,
         )
     if model_name == "datgan":
         datgan_dir = model_paths["datgan_dir"] if save_models else args.datgan_output_dir
@@ -1004,25 +1101,40 @@ def main(args: argparse.Namespace) -> None:
             raise ValueError(f"{dataset_name} dataset missing columns: {sorted(missing)}")
 
     per_seed_rows: List[Dict[str, Any]] = []
+    conditional_models = {"ddpm_tf", "ddpm_mlp", "tabddpm_tf"}
+    if args.tabddpm_conditional:
+        conditional_models = conditional_models | {"tabddpm"}
+
     for seed in seeds:
         _set_seed(seed)
-        sampled_truth_df = test_df.sample(
-            n=args.num_samples,
-            replace=True,
-            random_state=seed,
-        ).reset_index(drop=True)
+        # Conditional diffusion baselines: evaluate 1:1 against the full test set.
+        use_full_test = bool(set(args.models) & conditional_models) or args.num_samples <= 0
+        if use_full_test:
+            sampled_truth_df = test_df.reset_index(drop=True)
+            # Keep args.num_samples consistent for unconditional models in mixed runs.
+            if args.num_samples <= 0:
+                args.num_samples = len(test_df)
+        else:
+            sampled_truth_df = test_df.sample(
+                n=args.num_samples,
+                replace=True,
+                random_state=seed,
+            ).reset_index(drop=True)
         seed_dir = os.path.join(args.output_dir, f"seed_{seed}")
         os.makedirs(seed_dir, exist_ok=True)
         save_outputs = len(seeds) == 1
 
         for model_name in args.models:
             logging.info("Running baseline %s (seed=%d)", model_name.upper(), seed)
+            truth_df = sampled_truth_df
+            if model_name in conditional_models:
+                truth_df = test_df.reset_index(drop=True)
             generated_df = _run_model_for_seed(
                 model_name=model_name,
                 args=args,
                 train_df=train_df,
                 test_df=test_df,
-                sampled_truth_df=sampled_truth_df,
+                sampled_truth_df=truth_df,
                 seed=seed,
                 output_dir=seed_dir if not save_outputs else args.output_dir,
                 save_outputs=save_outputs,
@@ -1030,7 +1142,7 @@ def main(args: argparse.Namespace) -> None:
             row = _evaluate_and_save(
                 model_name=model_name,
                 generated_df=generated_df,
-                sampled_truth_df=sampled_truth_df,
+                sampled_truth_df=truth_df,
                 train_real_df=train_df,
                 test_real_df=test_df,
                 output_dir=seed_dir if not save_outputs else args.output_dir,
@@ -1121,17 +1233,28 @@ if __name__ == "__main__":
         "--models",
         nargs="+",
         default=["datgan"],
-        choices=["ctgan", "tvae", "tabddpm", "datgan", "vae", "ddpm_tf"],
+        choices=["ctgan", "tvae", "tabddpm", "tabddpm_tf", "datgan", "vae", "ddpm_tf", "ddpm_mlp"],
         help="Which baselines to run.",
     )
-    parser.add_argument("--num_samples", type=int, default=10000)
+    parser.add_argument(
+        "--num_samples",
+        type=int,
+        default=10000,
+        help="Sample count for unconditional baselines. Use 0 for |test|. "
+        "Conditional models (ddpm_*/tabddpm_tf) always generate full-test 1:1.",
+    )
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch_size", type=int, default=500)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--vae_latent_dim", type=int, default=64)
     parser.add_argument("--vae_hidden_dim", type=int, default=256)
     parser.add_argument("--vae_beta_kl", type=float, default=0.01)
-    parser.add_argument("--ddpm_t", type=int, default=10, help="Diffusion steps for ddpm_tf baseline.")
+    parser.add_argument(
+        "--ddpm_t",
+        type=int,
+        default=100,
+        help="Diffusion steps for Embedding-DDPM baselines (ddpm_tf / ddpm_mlp).",
+    )
     parser.add_argument("--tabddpm_t", type=int, default=100, help="Diffusion steps for TabDDPM baseline.")
     parser.add_argument(
         "--tabddpm_hidden_layers",
@@ -1139,6 +1262,16 @@ if __name__ == "__main__":
         type=int,
         default=[256, 512, 512, 256],
         help="MLP hidden layer sizes for TabDDPM denoiser.",
+    )
+    parser.add_argument("--tabddpm_tf_d_model", type=int, default=128)
+    parser.add_argument("--tabddpm_tf_nhead", type=int, default=8)
+    parser.add_argument("--tabddpm_tf_layers", type=int, default=4)
+    parser.add_argument("--tabddpm_tf_n_tokens", type=int, default=16)
+    parser.add_argument(
+        "--tabddpm_conditional",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Make MLP TabDDPM conditional on demographics (tabddpm_tf is always conditional).",
     )
     parser.add_argument("--ddpm_lambda_weight", type=float, default=1.0)
     parser.add_argument("--ddpm_lambda_joint", type=float, default=0.0)

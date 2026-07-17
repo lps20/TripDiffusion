@@ -3,6 +3,9 @@ Lightweight TabDDPM adapter for trip tabular baselines.
 
 Uses the official TabDDPM core (Gaussian + multinomial diffusion) from:
 https://github.com/yandex-research/tab-ddpm
+
+Supports optional demographic conditioning: diffuse trip columns only,
+condition the denoiser on one-hot demographics, and sample 1:1 from test conds.
 """
 
 from __future__ import annotations
@@ -17,16 +20,19 @@ import pandas as pd
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 
-from third_party.tab_ddpm import GaussianMultinomialDiffusion, MLPDiffusion
+from third_party.tab_ddpm import GaussianMultinomialDiffusion, MLPDiffusion, TransformerDiffusion
 
 
 def _split_tabddpm_columns(
     all_columns: List[str],
     time_columns: List[str],
     schema_by_name: Dict[str, Dict[str, Any]],
+    condition_columns: Optional[List[str]] = None,
 ) -> Tuple[List[str], List[str], np.ndarray]:
-    num_cols = [c for c in all_columns if c in time_columns]
-    cat_cols = [c for c in all_columns if c not in time_columns]
+    cond_set = set(condition_columns or [])
+    target_cols = [c for c in all_columns if c not in cond_set]
+    num_cols = [c for c in target_cols if c in time_columns]
+    cat_cols = [c for c in target_cols if c not in time_columns]
     cat_sizes = np.array([int(schema_by_name[c]["num_classes"]) for c in cat_cols], dtype=np.int64)
     return num_cols, cat_cols, cat_sizes
 
@@ -48,6 +54,21 @@ def _encode_tabddpm_frame(
         upper = int(schema_by_name[col]["num_classes"] - 1)
         vals = pd.to_numeric(df[col], errors="coerce").fillna(0).round().astype(int).clip(0, upper).values
         parts.append(vals.reshape(-1, 1).astype(np.float32))
+    return np.concatenate(parts, axis=1).astype(np.float32)
+
+
+def _encode_condition_onehot(
+    df: pd.DataFrame,
+    condition_columns: List[str],
+    schema_by_name: Dict[str, Dict[str, Any]],
+) -> np.ndarray:
+    parts: List[np.ndarray] = []
+    for col in condition_columns:
+        k = int(schema_by_name[col]["num_classes"])
+        vals = pd.to_numeric(df[col], errors="coerce").fillna(0).round().astype(int).clip(0, k - 1).values
+        parts.append(np.eye(k, dtype=np.float32)[vals])
+    if not parts:
+        return np.zeros((len(df), 1), dtype=np.float32)
     return np.concatenate(parts, axis=1).astype(np.float32)
 
 
@@ -75,6 +96,50 @@ def _update_ema(target_params, source_params, rate: float = 0.999) -> None:
         targ.detach().mul_(rate).add_(src.detach(), alpha=1 - rate)
 
 
+def _build_tabddpm_denoiser(
+    d_in: int,
+    backbone: str,
+    hidden_layers: Optional[List[int]] = None,
+    tf_d_model: int = 128,
+    tf_nhead: int = 8,
+    tf_layers: int = 4,
+    tf_n_tokens: int = 16,
+    is_y_cond: bool = False,
+    cond_dim: int = 0,
+):
+    backbone = (backbone or "mlp").lower()
+    if backbone == "mlp":
+        layers = hidden_layers or [256, 512, 512, 256]
+        return MLPDiffusion(
+            d_in=d_in,
+            num_classes=0,
+            is_y_cond=is_y_cond,
+            cond_dim=cond_dim,
+            rtdl_params={"d_layers": layers, "dropout": 0.0},
+        ), {"backbone": "mlp", "hidden_layers": layers, "is_y_cond": is_y_cond, "cond_dim": cond_dim}
+    if backbone in {"tf", "transformer"}:
+        model = TransformerDiffusion(
+            d_in=d_in,
+            num_classes=0,
+            is_y_cond=is_y_cond,
+            cond_dim=cond_dim,
+            d_model=tf_d_model,
+            nhead=tf_nhead,
+            num_layers=tf_layers,
+            n_tokens=tf_n_tokens,
+        )
+        return model, {
+            "backbone": "transformer",
+            "tf_d_model": tf_d_model,
+            "tf_nhead": tf_nhead,
+            "tf_layers": tf_layers,
+            "tf_n_tokens": tf_n_tokens,
+            "is_y_cond": is_y_cond,
+            "cond_dim": cond_dim,
+        }
+    raise ValueError(f"Unsupported TabDDPM backbone: {backbone!r}")
+
+
 def run_tabddpm(
     train_df: pd.DataFrame,
     all_columns: List[str],
@@ -88,29 +153,55 @@ def run_tabddpm(
     seed: int,
     model_save_path: Optional[str] = None,
     hidden_layers: Optional[List[int]] = None,
+    backbone: str = "mlp",
+    tf_d_model: int = 128,
+    tf_nhead: int = 8,
+    tf_layers: int = 4,
+    tf_n_tokens: int = 16,
+    condition_columns: Optional[List[str]] = None,
+    sample_cond_df: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
     from utils.multi_seed import set_global_seed
 
     set_global_seed(seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     schema_by_name = {field["name"]: field for field in schema}
-    num_cols, cat_cols, cat_sizes = _split_tabddpm_columns(all_columns, time_columns, schema_by_name)
+    condition_columns = list(condition_columns or [])
+    is_conditional = len(condition_columns) > 0
+
+    num_cols, cat_cols, cat_sizes = _split_tabddpm_columns(
+        all_columns, time_columns, schema_by_name, condition_columns=condition_columns
+    )
     num_numerical = len(num_cols)
 
     x_np = _encode_tabddpm_frame(train_df, num_cols, cat_cols, schema_by_name)
-    x_tensor = torch.from_numpy(x_np)
-    loader = DataLoader(TensorDataset(x_tensor), batch_size=batch_size, shuffle=True, drop_last=False)
+    if is_conditional:
+        y_np = _encode_condition_onehot(train_df, condition_columns, schema_by_name)
+        cond_dim = int(y_np.shape[1])
+        dataset = TensorDataset(torch.from_numpy(x_np), torch.from_numpy(y_np))
+    else:
+        cond_dim = 0
+        dataset = TensorDataset(torch.from_numpy(x_np))
+
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=False)
     data_iter = iter(loader)
     steps = max(epochs * max(len(loader), 1), 1)
 
     d_in = int(cat_sizes.sum() + num_numerical)
     layers = hidden_layers or [256, 512, 512, 256]
-    model = MLPDiffusion(
+    model, backbone_meta = _build_tabddpm_denoiser(
         d_in=d_in,
-        num_classes=0,
-        is_y_cond=False,
-        rtdl_params={"d_layers": layers, "dropout": 0.0},
-    ).to(device)
+        backbone=backbone,
+        hidden_layers=layers,
+        tf_d_model=tf_d_model,
+        tf_nhead=tf_nhead,
+        tf_layers=tf_layers,
+        tf_n_tokens=tf_n_tokens,
+        is_y_cond=is_conditional,
+        cond_dim=cond_dim,
+    )
+    model = model.to(device)
+    n_params = sum(p.numel() for p in model.parameters())
 
     diffusion = GaussianMultinomialDiffusion(
         num_classes=cat_sizes,
@@ -131,24 +222,38 @@ def run_tabddpm(
     y_dummy = torch.tensor([1.0], device=device)
 
     logging.info(
-        "TabDDPM: num_cols=%s, cat_cols=%d, T=%d, steps=%d, d_in=%d",
+        "TabDDPM: backbone=%s, conditional=%s, cond_cols=%s, num_cols=%s, cat_cols=%d, "
+        "T=%d, steps=%d, d_in=%d, cond_dim=%d, params=%d",
+        backbone_meta.get("backbone"),
+        is_conditional,
+        condition_columns,
         num_cols,
         len(cat_cols),
         num_timesteps,
         steps,
         d_in,
+        cond_dim,
+        n_params,
     )
 
     step = 0
     while step < steps:
         try:
-            (batch_x,) = next(data_iter)
+            batch = next(data_iter)
         except StopIteration:
             data_iter = iter(loader)
-            (batch_x,) = next(data_iter)
+            batch = next(data_iter)
 
-        batch_x = batch_x.to(device)
-        out_dict = {"y": torch.zeros(batch_x.size(0), dtype=torch.long, device=device)}
+        if is_conditional:
+            batch_x, batch_y = batch
+            batch_x = batch_x.to(device)
+            batch_y = batch_y.to(device)
+            out_dict = {"y": batch_y}
+        else:
+            (batch_x,) = batch
+            batch_x = batch_x.to(device)
+            out_dict = {"y": torch.zeros(batch_x.size(0), dtype=torch.long, device=device)}
+
         optimizer.zero_grad()
         loss_multi, loss_gauss = diffusion.mixed_loss(batch_x, out_dict)
         loss = loss_multi + loss_gauss
@@ -183,6 +288,8 @@ def run_tabddpm(
                 "num_timesteps": num_timesteps,
                 "hidden_layers": layers,
                 "all_columns": all_columns,
+                "condition_columns": condition_columns,
+                **backbone_meta,
             },
             model_save_path,
         )
@@ -191,6 +298,20 @@ def run_tabddpm(
     diffusion.eval()
     ema_model.eval()
     diffusion._denoise_fn = ema_model
+
+    if is_conditional:
+        cond_src = sample_cond_df if sample_cond_df is not None else train_df
+        if sample_cond_df is not None or n_samples <= 0:
+            cond_src = cond_src.reset_index(drop=True)
+            n_samples = len(cond_src)
+        else:
+            cond_src = cond_src.sample(n=n_samples, replace=True, random_state=seed).reset_index(drop=True)
+        y_all = torch.from_numpy(_encode_condition_onehot(cond_src, condition_columns, schema_by_name)).to(device)
+        x_gen, _ = diffusion.sample_all(n_samples, batch_size, y_dummy, ddim=False, y=y_all)
+        decoded = _decode_tabddpm_array(x_gen.numpy(), num_cols, cat_cols, schema_by_name)
+        for col in condition_columns:
+            decoded[col] = cond_src[col].astype(int).values
+        return decoded[all_columns]
 
     generated = []
     remaining = n_samples
@@ -217,14 +338,22 @@ def _build_tabddpm_from_checkpoint(
     num_timesteps = int(checkpoint["num_timesteps"])
     layers = list(checkpoint.get("hidden_layers") or [256, 512, 512, 256])
     num_numerical = len(num_cols)
+    is_y_cond = bool(checkpoint.get("is_y_cond", False))
+    cond_dim = int(checkpoint.get("cond_dim") or 0)
 
     d_in = int(cat_sizes.sum() + num_numerical)
-    model = MLPDiffusion(
+    model, _ = _build_tabddpm_denoiser(
         d_in=d_in,
-        num_classes=0,
-        is_y_cond=False,
-        rtdl_params={"d_layers": layers, "dropout": 0.0},
-    ).to(device)
+        backbone=str(checkpoint.get("backbone") or "mlp"),
+        hidden_layers=layers,
+        tf_d_model=int(checkpoint.get("tf_d_model") or 128),
+        tf_nhead=int(checkpoint.get("tf_nhead") or 8),
+        tf_layers=int(checkpoint.get("tf_layers") or 4),
+        tf_n_tokens=int(checkpoint.get("tf_n_tokens") or 16),
+        is_y_cond=is_y_cond,
+        cond_dim=cond_dim,
+    )
+    model = model.to(device)
     diffusion = GaussianMultinomialDiffusion(
         num_classes=cat_sizes,
         num_numerical_features=num_numerical,
@@ -248,6 +377,7 @@ def sample_tabddpm_from_checkpoint(
     n_samples: int,
     batch_size: int = 500,
     device: Optional[torch.device] = None,
+    sample_cond_df: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
     device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
     checkpoint = torch.load(checkpoint_path, map_location=device)
@@ -258,7 +388,22 @@ def sample_tabddpm_from_checkpoint(
         checkpoint, schema, device
     )
     all_columns = list(checkpoint["all_columns"])
+    condition_columns = list(checkpoint.get("condition_columns") or [])
     y_dummy = torch.tensor([1.0], device=device)
+
+    if condition_columns:
+        if sample_cond_df is None:
+            raise ValueError("Conditional TabDDPM checkpoint requires sample_cond_df.")
+        cond_src = sample_cond_df.reset_index(drop=True)
+        n_samples = len(cond_src)
+        y_all = torch.from_numpy(
+            _encode_condition_onehot(cond_src, condition_columns, schema_by_name)
+        ).to(device)
+        x_gen, _ = diffusion.sample_all(n_samples, batch_size, y_dummy, ddim=False, y=y_all)
+        decoded = _decode_tabddpm_array(x_gen.detach().cpu().numpy(), num_cols, cat_cols, schema_by_name)
+        for col in condition_columns:
+            decoded[col] = cond_src[col].astype(int).values
+        return decoded[all_columns]
 
     generated = []
     remaining = n_samples
