@@ -89,10 +89,11 @@ class SoftCausalAdapterBlock(nn.Module):
     Global shared feature tokens are always available in each stream.
     """
 
-    def __init__(self, d_model, nhead, dropout=0.2, gate_init=None, st_cascade=False, st_loc_chain_idx=None, st_time_chain_idx=None):
+    def __init__(self, d_model, nhead, dropout=0.2, gate_init=None, st_cascade=False, st_loc_chain_idx=None, st_time_chain_idx=None, hard_stream_cascade=False):
         super().__init__()
         gate_init = gate_init or {}
         self.st_cascade = st_cascade
+        self.hard_stream_cascade = bool(hard_stream_cascade)
         self.st_loc_chain_idx = st_loc_chain_idx or []
         self.st_time_chain_idx = st_time_chain_idx or []
         self.act_self = nn.MultiheadAttention(d_model, nhead, batch_first=True, dropout=dropout)
@@ -189,6 +190,31 @@ class SoftCausalAdapterBlock(nn.Module):
         return x_old + alpha * (x_new - x_old)
 
     def forward(self, h_act, h_st, h_mode, h_cond, h_shared):
+        if self.hard_stream_cascade:
+            # True stream-level hard cascade: act -> st -> mode (each sees updated upstream).
+            act_ctx = torch.cat([h_cond, h_shared], dim=1)
+            act_new = self._update_stream(
+                h_act, self.act_self, self.act_cross, self.act_ffn, self.act_norm1, self.act_norm2, self.act_norm3, act_ctx
+            )
+            h_act = act_new
+
+            st_ctx = torch.cat([h_cond, h_shared, h_act], dim=1)
+            if self.st_cascade:
+                st_new = self._update_st_cascade(h_st, st_ctx)
+            else:
+                st_new = self._update_stream(
+                    h_st, self.st_self, self.st_cross, self.st_ffn, self.st_norm1, self.st_norm2, self.st_norm3, st_ctx
+                )
+            h_st = st_new
+
+            mode_ctx = torch.cat([h_cond, h_shared, h_act, h_st], dim=1)
+            mode_new = self._update_stream(
+                h_mode, self.mode_self, self.mode_cross, self.mode_ffn, self.mode_norm1, self.mode_norm2, self.mode_norm3, mode_ctx
+            )
+            h_mode = mode_new
+            return h_act, h_st, h_mode
+
+        # Soft / parallel causal adapters (default): contexts use pre-update streams, then gated residual.
         act_ctx = torch.cat([h_cond, h_shared], dim=1)
         st_ctx = torch.cat([h_cond, h_shared, h_act], dim=1)
         mode_ctx = torch.cat([h_cond, h_shared, h_act, h_st], dim=1)
@@ -223,6 +249,7 @@ class TripDiffusionModel(nn.Module):
         freeze_gates=False,
         st_cascade=False,
         st_cascade_chain="loc_then_time",
+        hard_stream_cascade=False,
         use_joint_heads=True,
         d_model=128,
         shared_layers=2,
@@ -238,6 +265,7 @@ class TripDiffusionModel(nn.Module):
         self.joint_pairs = joint_pairs if joint_pairs is not None else []
         self.st_cascade = st_cascade
         self.st_cascade_chain = st_cascade_chain if st_cascade else None
+        self.hard_stream_cascade = bool(hard_stream_cascade)
         self.use_joint_heads = use_joint_heads
         self.freeze_gates = bool(freeze_gates)
 
@@ -306,6 +334,7 @@ class TripDiffusionModel(nn.Module):
                     st_cascade=st_cascade,
                     st_loc_chain_idx=self.st_loc_chain_idx,
                     st_time_chain_idx=self.st_time_chain_idx,
+                    hard_stream_cascade=self.hard_stream_cascade,
                 )
                 for _ in range(self.causal_layers)
             ]

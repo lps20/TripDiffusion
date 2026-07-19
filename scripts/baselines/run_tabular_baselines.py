@@ -680,10 +680,13 @@ def _run_datgan(
     dag_mode: str = "cascade",
     continuous_time: bool = True,
     save_model: bool = True,
+    condition_columns: Optional[List[str]] = None,
+    sample_cond_df: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
     datgan_class = _import_datgan_class()
     os.makedirs(output_dir, exist_ok=True)
     datgan_output = os.path.join(output_dir, "")
+    condition_columns = list(condition_columns or [])
 
     init_kwargs = _filter_kwargs(
         datgan_class,
@@ -695,6 +698,7 @@ def _run_datgan(
             "save_checkpoints": save_model,
             "restore_session": False,
             "verbose": 1,
+            "conditional_inputs": condition_columns if condition_columns else None,
         },
     )
     model = datgan_class(**init_kwargs)
@@ -714,15 +718,55 @@ def _run_datgan(
         },
     )
     logging.info(
-        "DATGAN fit config: dag_mode=%s, continuous_time=%s, epochs=%d, batch_size=%d",
+        "DATGAN fit config: dag_mode=%s, continuous_time=%s, conditional=%s, "
+        "cond_cols=%s, epochs=%d, batch_size=%d",
         dag_mode,
         continuous_time,
+        bool(condition_columns),
+        condition_columns,
         epochs,
         batch_size,
     )
     fit_fn(train_df[all_columns], **fit_kwargs)
     if save_model:
         logging.info("Saved DATGAN artifacts under: %s", output_dir)
+
+    if condition_columns:
+        if sample_cond_df is None:
+            raise ValueError("Conditional DATGAN requires sample_cond_df for 1:1 sampling.")
+        cond_src = sample_cond_df.reset_index(drop=True)
+        inputs = cond_src[condition_columns].copy()
+        n_out = len(inputs)
+        # DATGAN.sample concatenates every batch into one growing DataFrame; that OOMs
+        # on full-test (~500k). Sample in chunks and concat once at the end.
+        chunk_size = max(int(batch_size) * 20, int(batch_size))
+        logging.info(
+            "DATGAN conditional sample: n=%d, chunk_size=%d, randomize=False, cond_cols=%s",
+            n_out,
+            chunk_size,
+            condition_columns,
+        )
+        chunks: List[pd.DataFrame] = []
+        for start in range(0, n_out, chunk_size):
+            end = min(start + chunk_size, n_out)
+            part_inputs = inputs.iloc[start:end].reset_index(drop=True)
+            part = model.sample(
+                num_samples=len(part_inputs),
+                inputs=part_inputs,
+                cond_dict={},
+                randomize=False,
+                timeout=False,
+            )
+            if not isinstance(part, pd.DataFrame):
+                part = pd.DataFrame(part, columns=all_columns)
+            for col in condition_columns:
+                part[col] = part_inputs[col].values
+            chunks.append(part[all_columns])
+            if (end % (chunk_size * 5) == 0) or end == n_out:
+                logging.info("DATGAN conditional sample progress: %d/%d", end, n_out)
+        generated = pd.concat(chunks, ignore_index=True)
+        return generated[all_columns]
+
     return _sample_model(model, n_samples, all_columns)
 
 
@@ -1064,6 +1108,7 @@ def _run_model_for_seed(
         )
     if model_name == "datgan":
         datgan_dir = model_paths["datgan_dir"] if save_models else args.datgan_output_dir
+        cond_cols = COND_COLUMNS if args.datgan_conditional else None
         return _run_datgan(
             train_df=train_df,
             all_columns=ALL_COLUMNS,
@@ -1074,6 +1119,8 @@ def _run_model_for_seed(
             dag_mode=args.datgan_dag,
             continuous_time=args.datgan_continuous_time,
             save_model=save_models,
+            condition_columns=cond_cols,
+            sample_cond_df=test_df if cond_cols else None,
         )
     raise ValueError(f"Unsupported model: {model_name}")
 
@@ -1104,6 +1151,8 @@ def main(args: argparse.Namespace) -> None:
     conditional_models = {"ddpm_tf", "ddpm_mlp", "tabddpm_tf"}
     if args.tabddpm_conditional:
         conditional_models = conditional_models | {"tabddpm"}
+    if args.datgan_conditional:
+        conditional_models = conditional_models | {"datgan"}
 
     for seed in seeds:
         _set_seed(seed)
@@ -1228,6 +1277,12 @@ if __name__ == "__main__":
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Treat start/trip time columns as continuous in DATGAN metadata.",
+    )
+    parser.add_argument(
+        "--datgan_conditional",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Train/sample DATGAN with demographics as conditional_inputs (true conditional, 1:1 test).",
     )
     parser.add_argument(
         "--models",

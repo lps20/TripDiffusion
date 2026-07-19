@@ -159,6 +159,7 @@ def run_once(args, seed, exp_dir):
         freeze_gates=args.freeze_gates,
         st_cascade=args.st_cascade,
         st_cascade_chain=args.st_cascade_chain,
+        hard_stream_cascade=args.hard_stream_cascade,
         use_joint_heads=not args.no_joint_heads,
         d_model=d_model,
         shared_layers=shared_layers,
@@ -166,6 +167,8 @@ def run_once(args, seed, exp_dir):
     ).to(device)
     num_params = sum(p.numel() for p in model.parameters())
     logging.info("Model parameters: %d (%.2f M)", num_params, num_params / 1e6)
+    if args.hard_stream_cascade:
+        logging.info("Using HARD stream cascade: act -> st -> mode (sequential, full replace, no soft gates).")
     if args.freeze_gates:
         import math as _math
 
@@ -307,6 +310,7 @@ def run_once(args, seed, exp_dir):
         "joint_gibbs_iters": int(args.joint_gibbs_iters) if args.joint_sampling_at_inference else None,
         "st_cascade": bool(args.st_cascade),
         "st_cascade_chain": args.st_cascade_chain if args.st_cascade else None,
+        "hard_stream_cascade": bool(args.hard_stream_cascade),
         "freeze_gates": bool(args.freeze_gates),
         "gate_init_act": float(args.gate_init_act),
         "gate_init_st": float(args.gate_init_st),
@@ -471,6 +475,11 @@ if __name__ == "__main__":
         "--st_cascade",
         action="store_true",
         help="Use ST loc/time mini-cascade inside causal adapters (Step B).",
+    )
+    parser.add_argument(
+        "--hard_stream_cascade",
+        action="store_true",
+        help="Hard stream cascade: update act->st->mode sequentially with full replace (no soft gates).",
     )
     parser.add_argument(
         "--st_cascade_chain",
