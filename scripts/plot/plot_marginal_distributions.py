@@ -10,21 +10,30 @@ from project_paths import setup
 setup()
 
 import os
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
 
-MODEL_SOURCES: List[Tuple[str, str]] = [
-    ("Real World", "data/test_data.csv"),
-    ("VAE", "exp/baseline/VAE_gene.csv"),
-    ("CTGAN", "exp/baseline/CTGAN_gene.csv"),
-    ("DATGAN", "exp/baseline/DATGAN_gene.csv"),
-    ("DDPM+TF", "exp/baseline/DDPM_TF_gene.csv"),
-    ("D3PM+TF", "exp/tsf/generated_samples.csv"),
-    ("D3PM+SC3T", "exp/hcd_v2/generated_samples.csv"),
+_REVISION_BASELINE_ROOT = _REPO_ROOT.parent / "D3PM_revision" / "revision_exp" / "baselines"
+
+MODEL_SOURCES: List[Tuple[str, Optional[Path]]] = [
+    ("Ground Truth", _REPO_ROOT / "data" / "test_data.csv"),
+    (
+        "Sequential\nEconometric",
+        _REVISION_BASELINE_ROOT / "sequential_econ" / "seed_42" / "SEQUENTIAL_ECON_gene.csv",
+    ),
+    (
+        "Embedding-\nDDPM",
+        _REVISION_BASELINE_ROOT / "embedding_ddpm_fixed" / "seed_42" / "DDPM_TF_gene.csv",
+    ),
+    ("TVAE", _REVISION_BASELINE_ROOT / "tvae" / "seed_42" / "TVAE_gene.csv"),
+    ("CTGAN", _REVISION_BASELINE_ROOT / "ctgan" / "seed_42" / "CTGAN_gene.csv"),
+    ("DATGAN", _REVISION_BASELINE_ROOT / "datgan" / "seed_42" / "DATGAN_gene.csv"),
+    ("TabDDPM", _REVISION_BASELINE_ROOT / "tabddpm" / "seed_42" / "TABDDPM_gene.csv"),
+    ("D3PM-SC3T\n(Ours)", _REVISION_BASELINE_ROOT / "hcd" / "seed_42" / "generated_samples.csv"),
 ]
 
 
@@ -82,6 +91,7 @@ ACTIVITY_TIME_ORDER: List[str] = [
     "Leisure",
     "Other",
     "Shopping",
+    "Travel",
     "Work",
 ]
 
@@ -105,10 +115,22 @@ def _configure_academic_style() -> None:
     )
 
 
-def _load_csv(path: str) -> pd.DataFrame:
-    if not os.path.exists(path):
+def _load_csv(path: Path) -> pd.DataFrame:
+    if not path.exists():
         raise FileNotFoundError(f"Missing file: {path}")
     return pd.read_csv(path)
+
+
+def _draw_todo_panel(ax: plt.Axes, title: str) -> None:
+    """Reserve a panel for a model whose revised outputs are still pending."""
+    ax.set_title(title, pad=6)
+    ax.set_xticks([])
+    ax.set_yticks([])
+    ax.text(0.5, 0.5, "TODO", transform=ax.transAxes, ha="center", va="center", color="#666666")
+    for spine in ax.spines.values():
+        spine.set_visible(True)
+        spine.set_color("#bdbdbd")
+        spine.set_linewidth(0.8)
 
 
 def _to_int_series(df: pd.DataFrame, col: str) -> pd.Series:
@@ -244,7 +266,7 @@ def _mode_time_joint_percentages(df: pd.DataFrame) -> np.ndarray:
 
 
 def _plot_vertical_heatmap_comparison(
-    values_by_model: Sequence[np.ndarray],
+    values_by_model: Sequence[Optional[np.ndarray]],
     row_labels: Sequence[str],
     model_labels: Sequence[str],
     y_label: str,
@@ -269,6 +291,10 @@ def _plot_vertical_heatmap_comparison(
     for i, ax in enumerate(axes_flat):
         if i >= n_models:
             ax.set_visible(False)
+            continue
+
+        if values_by_model[i] is None:
+            _draw_todo_panel(ax, model_labels[i])
             continue
 
         col = np.asarray(values_by_model[i], dtype=float).reshape(-1, 1)
@@ -309,7 +335,7 @@ def _plot_vertical_heatmap_comparison(
 
 
 def _plot_joint_time_heatmap_comparison(
-    values_by_model: Sequence[np.ndarray],
+    values_by_model: Sequence[Optional[np.ndarray]],
     row_labels: Sequence[str],
     model_labels: Sequence[str],
     y_label: str,
@@ -322,8 +348,8 @@ def _plot_joint_time_heatmap_comparison(
     fig, axes = plt.subplots(
         n_rows,
         n_cols,
-        figsize=(3.3 * n_cols + 1.1, 2.9 * n_rows + 0.35),
-        gridspec_kw={"wspace": 0.14, "hspace": 0.18},
+        figsize=(3.9 * n_cols + 1.1, 3.7 * n_rows + 0.35),
+        gridspec_kw={"wspace": 0.14, "hspace": 0.24},
         constrained_layout=True,
     )
     axes_flat = np.atleast_2d(axes).ravel()
@@ -338,6 +364,10 @@ def _plot_joint_time_heatmap_comparison(
             ax.set_visible(False)
             continue
 
+        if values_by_model[i] is None:
+            _draw_todo_panel(ax, model_labels[i])
+            continue
+
         mat = np.asarray(values_by_model[i], dtype=float)
         image_ref = ax.imshow(mat, cmap=cmap, vmin=0.0, vmax=100.0, aspect="auto", interpolation="nearest")
 
@@ -350,7 +380,7 @@ def _plot_joint_time_heatmap_comparison(
 
         ax.set_yticks(np.arange(len(row_labels)))
         if i % n_cols == 0:
-            ax.set_yticklabels(row_labels, fontsize=22)
+            ax.set_yticklabels(row_labels, fontsize=15)
         else:
             ax.set_yticklabels([])
         ax.set_title(model_labels[i], pad=6)
@@ -371,7 +401,7 @@ def _plot_joint_time_heatmap_comparison(
 
 
 def _plot_od_matrix_heatmap_comparison(
-    values_by_model: Sequence[np.ndarray],
+    values_by_model: Sequence[Optional[np.ndarray]],
     model_labels: Sequence[str],
     start_order: Sequence[int],
     end_order: Sequence[int],
@@ -396,23 +426,25 @@ def _plot_od_matrix_heatmap_comparison(
         if i >= n_models:
             ax.set_visible(False)
             continue
+        if values_by_model[i] is None:
+            _draw_todo_panel(ax, model_labels[i])
+            continue
+
         mat = np.asarray(values_by_model[i], dtype=float)
         image_ref = ax.imshow(mat, cmap=cmap, vmin=0.0, vmax=100.0, aspect="auto", interpolation="nearest")
 
         x_idx = np.arange(len(end_order))
         y_idx = np.arange(len(start_order))
-        x_step = 1 if len(end_order) <= 8 else 2
-        y_step = 1 if len(start_order) <= 8 else 2
-        ax.set_xticks(x_idx[::x_step])
-        ax.set_yticks(y_idx[::y_step])
+        ax.set_xticks(x_idx)
+        ax.set_yticks(y_idx)
 
         if i // n_cols == n_rows - 1:
-            ax.set_xticklabels([str(end_order[j]) for j in x_idx[::x_step]], fontsize=17)
+            ax.set_xticklabels([str(end_order[j]) for j in x_idx], fontsize=12)
         else:
             ax.set_xticklabels([])
 
         if i % n_cols == 0:
-            ax.set_yticklabels([str(start_order[j]) for j in y_idx[::y_step]], fontsize=17)
+            ax.set_yticklabels([str(start_order[j]) for j in y_idx], fontsize=12)
         else:
             ax.set_yticklabels([])
 
@@ -420,7 +452,7 @@ def _plot_od_matrix_heatmap_comparison(
         for spine in ax.spines.values():
             spine.set_visible(False)
 
-    fig.supxlabel("End Zone Code", y=-0.02)
+    fig.supxlabel("End Zone Code", y=-0.06)
     fig.supylabel("Start Zone Code", x=-0.02)
     used_axes = [axes_flat[k] for k in range(n_models)]
     cbar = fig.colorbar(image_ref, ax=used_axes, fraction=0.02, pad=0.01)
@@ -434,22 +466,30 @@ def _plot_od_matrix_heatmap_comparison(
 
 def main() -> None:
     _configure_academic_style()
-    os.makedirs("figs", exist_ok=True)
+    os.makedirs("figs_revision", exist_ok=True)
 
     model_labels: List[str] = []
-    activity_values: List[np.ndarray] = []
-    mode_values: List[np.ndarray] = []
-    activity_time_values: List[np.ndarray] = []
-    mode_time_values: List[np.ndarray] = []
-    od_values: List[np.ndarray] = []
+    activity_values: List[Optional[np.ndarray]] = []
+    mode_values: List[Optional[np.ndarray]] = []
+    activity_time_values: List[Optional[np.ndarray]] = []
+    mode_time_values: List[Optional[np.ndarray]] = []
+    od_values: List[Optional[np.ndarray]] = []
     od_start_order: List[int] = []
     od_end_order: List[int] = []
 
     for idx, (model_name, csv_path) in enumerate(MODEL_SOURCES):
+        model_labels.append(model_name)
+        if csv_path is None:
+            activity_values.append(None)
+            mode_values.append(None)
+            activity_time_values.append(None)
+            mode_time_values.append(None)
+            od_values.append(None)
+            continue
+
         df = _load_csv(csv_path)
         if idx == 0:
             od_start_order, od_end_order = _select_top_od_axes(df_real=df, top_k=OD_TOP_K)
-        model_labels.append(model_name)
         activity_values.append(_activity_percentages(df))
         mode_values.append(_mode_percentages(df))
         activity_time_values.append(_activity_time_joint_percentages(df))
@@ -461,8 +501,8 @@ def main() -> None:
         row_labels=ACTIVITY_ORDER,
         model_labels=model_labels,
         y_label="Activity",
-        out_png="figs/activity_marginal_comparison.png",
-        out_pdf="figs/activity_marginal_comparison.pdf",
+        out_png="figs_revision/activity_marginal_comparison.png",
+        out_pdf="figs_revision/activity_marginal_comparison.pdf",
     )
 
     _plot_vertical_heatmap_comparison(
@@ -470,8 +510,8 @@ def main() -> None:
         row_labels=MODE_ORDER,
         model_labels=model_labels,
         y_label="Mode",
-        out_png="figs/mode_marginal_comparison.png",
-        out_pdf="figs/mode_marginal_comparison.pdf",
+        out_png="figs_revision/mode_marginal_comparison.png",
+        out_pdf="figs_revision/mode_marginal_comparison.pdf",
     )
 
     _plot_joint_time_heatmap_comparison(
@@ -479,8 +519,8 @@ def main() -> None:
         row_labels=ACTIVITY_TIME_ORDER,
         model_labels=model_labels,
         y_label="Activity Type",
-        out_png="figs/activity_time_joint_comparison.png",
-        out_pdf="figs/activity_time_joint_comparison.pdf",
+        out_png="figs_revision/activity_time_joint_comparison.png",
+        out_pdf="figs_revision/activity_time_joint_comparison.pdf",
     )
 
     _plot_joint_time_heatmap_comparison(
@@ -488,8 +528,8 @@ def main() -> None:
         row_labels=MODE_ORDER,
         model_labels=model_labels,
         y_label="Mode Type",
-        out_png="figs/mode_time_joint_comparison.png",
-        out_pdf="figs/mode_time_joint_comparison.pdf",
+        out_png="figs_revision/mode_time_joint_comparison.png",
+        out_pdf="figs_revision/mode_time_joint_comparison.pdf",
     )
 
     _plot_od_matrix_heatmap_comparison(
@@ -497,8 +537,8 @@ def main() -> None:
         model_labels=model_labels,
         start_order=od_start_order,
         end_order=od_end_order,
-        out_png="figs/od_matrix_comparison.png",
-        out_pdf="figs/od_matrix_comparison.pdf",
+        out_png="figs_revision/od_matrix_comparison.png",
+        out_pdf="figs_revision/od_matrix_comparison.pdf",
     )
 
 

@@ -17,14 +17,23 @@ import numpy as np
 import pandas as pd
 
 
-MODEL_SOURCES: List[Tuple[str, str]] = [
-    ("Real World", "data/test_data.csv"),
-    ("VAE", "exp/baseline/VAE_gene.csv"),
-    ("CTGAN", "exp/baseline/CTGAN_gene.csv"),
-    ("DATGAN", "exp/baseline/DATGAN_gene.csv"),
-    ("DDPM+TF", "exp/baseline/DDPM_TF_gene.csv"),
-    ("D3PM+TF", "exp/tsf/generated_samples.csv"),
-    ("D3PM+SC3T", "exp/hcd_v2/generated_samples.csv"),
+_REVISION_BASELINE_ROOT = _REPO_ROOT.parent / "D3PM_revision" / "revision_exp" / "baselines"
+
+MODEL_SOURCES: List[Tuple[str, Optional[Path]]] = [
+    ("Ground Truth", _REPO_ROOT / "data" / "test_data.csv"),
+    (
+        "Sequential\nEconometric",
+        _REVISION_BASELINE_ROOT / "sequential_econ" / "seed_42" / "SEQUENTIAL_ECON_gene.csv",
+    ),
+    (
+        "Embedding-\nDDPM",
+        _REVISION_BASELINE_ROOT / "embedding_ddpm_fixed" / "seed_42" / "DDPM_TF_gene.csv",
+    ),
+    ("TVAE", _REVISION_BASELINE_ROOT / "tvae" / "seed_42" / "TVAE_gene.csv"),
+    ("CTGAN", _REVISION_BASELINE_ROOT / "ctgan" / "seed_42" / "CTGAN_gene.csv"),
+    ("DATGAN", _REVISION_BASELINE_ROOT / "datgan" / "seed_42" / "DATGAN_gene.csv"),
+    ("TabDDPM", _REVISION_BASELINE_ROOT / "tabddpm" / "seed_42" / "TABDDPM_gene.csv"),
+    ("D3PM-SC3T\n(Ours)", _REVISION_BASELINE_ROOT / "hcd" / "seed_42" / "generated_samples.csv"),
 ]
 
 
@@ -110,10 +119,22 @@ def _configure_style() -> None:
     )
 
 
-def _load_csv(path: str) -> pd.DataFrame:
-    if not os.path.exists(path):
+def _load_csv(path: Path) -> pd.DataFrame:
+    if not path.exists():
         raise FileNotFoundError(f"Missing file: {path}")
     return pd.read_csv(path)
+
+
+def _draw_todo_panel(ax: plt.Axes, title: str) -> None:
+    """Reserve a panel for a model whose revised outputs are still pending."""
+    ax.set_title(title, pad=6)
+    ax.set_xticks([])
+    ax.set_yticks([])
+    ax.text(0.5, 0.5, "TODO", transform=ax.transAxes, ha="center", va="center", color="#666666")
+    for spine in ax.spines.values():
+        spine.set_visible(True)
+        spine.set_color("#bdbdbd")
+        spine.set_linewidth(0.8)
 
 
 def _compute_joint_pct(
@@ -153,10 +174,10 @@ def _compute_joint_pct(
 
     counts = pd.crosstab(work["_row"], work["_col"])
     counts = counts.reindex(index=row_order, columns=col_order, fill_value=0)
-    total = counts.to_numpy().sum()
-    if total <= 0:
-        return np.zeros((len(row_order), len(col_order)), dtype=float)
-    return counts.to_numpy(dtype=float) / float(total) * 100.0
+    column_totals = counts.sum(axis=0).replace(0, np.nan)
+    percentages = counts.divide(column_totals, axis=1) * 100.0
+    return percentages.fillna(0.0).to_numpy(dtype=float)
+
 
 
 def _joint_grid_shape(n_models: int) -> Tuple[int, int]:
@@ -167,7 +188,7 @@ def _joint_grid_shape(n_models: int) -> Tuple[int, int]:
 
 
 def _plot_joint_heatmap_comparison(
-    mats: Sequence[np.ndarray],
+    mats: Sequence[Optional[np.ndarray]],
     row_labels: Sequence[str],
     col_labels: Sequence[str],
     subplot_titles: Sequence[str],
@@ -201,7 +222,10 @@ def _plot_joint_heatmap_comparison(
         fig, axes = plt.subplots(nrows, ncols, figsize=fig_size, constrained_layout=True)
     axes_flat = np.atleast_2d(axes).ravel()
 
-    vmax = max(float(np.max(m)) for m in mats)
+    finalized_mats = [m for m in mats if m is not None]
+    if not finalized_mats:
+        raise ValueError("At least one finalized matrix is required.")
+    vmax = max(float(np.max(m)) for m in finalized_mats)
     if vmax <= 0:
         vmax = 1.0
 
@@ -212,6 +236,10 @@ def _plot_joint_heatmap_comparison(
             continue
 
         mat = mats[i]
+        if mat is None:
+            _draw_todo_panel(ax, subplot_titles[i])
+            continue
+
         image_ref = ax.imshow(mat, cmap="YlGnBu", vmin=0.0, vmax=vmax, aspect="auto", interpolation="nearest")
         ax.set_title(subplot_titles[i], pad=6)
 
@@ -247,7 +275,7 @@ def _plot_joint_heatmap_comparison(
         fig.supylabel(y_label, x=-0.02, fontsize=plt.rcParams["axes.labelsize"])
     used_axes = [axes_flat[k] for k in range(n_models)]
     cbar = fig.colorbar(image_ref, ax=used_axes, fraction=0.022, pad=0.01)
-    cbar.set_label("Percentage of total trips")
+    cbar.set_label("Percentage within demographic group")
     cbar.ax.tick_params(labelsize=20)
 
     fig.savefig(out_png, bbox_inches="tight")
@@ -257,20 +285,29 @@ def _plot_joint_heatmap_comparison(
 
 def main() -> None:
     _configure_style()
-    os.makedirs("figs", exist_ok=True)
+    os.makedirs("figs_revision", exist_ok=True)
 
     model_names = [name for name, _ in MODEL_SOURCES]
     subplot_titles = _model_panel_titles(model_names)
     n_models = len(MODEL_SOURCES)
 
-    loaded: List[Tuple[str, pd.DataFrame]] = [(name, _load_csv(path)) for name, path in MODEL_SOURCES]
+    loaded: List[Tuple[str, Optional[pd.DataFrame]]] = [
+        (name, None if path is None else _load_csv(path)) for name, path in MODEL_SOURCES
+    ]
 
-    age_act_mats: List[np.ndarray] = []
-    age_mode_mats: List[np.ndarray] = []
-    gender_act_mats: List[np.ndarray] = []
-    gender_mode_mats: List[np.ndarray] = []
+    age_act_mats: List[Optional[np.ndarray]] = []
+    age_mode_mats: List[Optional[np.ndarray]] = []
+    gender_act_mats: List[Optional[np.ndarray]] = []
+    gender_mode_mats: List[Optional[np.ndarray]] = []
 
     for _, df in loaded:
+        if df is None:
+            age_act_mats.append(None)
+            age_mode_mats.append(None)
+            gender_act_mats.append(None)
+            gender_mode_mats.append(None)
+            continue
+
         mask_travel_mode = (pd.to_numeric(df["act_num"], errors="coerce") == 1) & (
             pd.to_numeric(df["mode_num"], errors="coerce").isin([3, 4, 5, 6, 7, 8])
         )
@@ -332,8 +369,8 @@ def main() -> None:
         subplot_titles=subplot_titles,
         x_label="Age Group",
         y_label="Activity",
-        out_png="figs/age_activity_joint_vertical.png",
-        out_pdf="figs/age_activity_joint_vertical.pdf",
+        out_png="figs_revision/age_activity_joint_vertical.png",
+        out_pdf="figs_revision/age_activity_joint_vertical.pdf",
         layout="stacked",
         fig_size=(13.6, max(4.35 * n_models, 6.0)),
         cell_fontsize=18,
@@ -346,8 +383,8 @@ def main() -> None:
         subplot_titles=subplot_titles,
         x_label="Age Group",
         y_label="Mode",
-        out_png="figs/age_mode_joint_vertical.png",
-        out_pdf="figs/age_mode_joint_vertical.pdf",
+        out_png="figs_revision/age_mode_joint_vertical.png",
+        out_pdf="figs_revision/age_mode_joint_vertical.pdf",
         layout="stacked",
         fig_size=(13.6, max(4.0 * n_models, 5.5)),
         cell_fontsize=18,
@@ -364,8 +401,8 @@ def main() -> None:
         subplot_titles=subplot_titles,
         x_label="Gender",
         y_label="Activity",
-        out_png="figs/gender_activity_joint_vertical.png",
-        out_pdf="figs/gender_activity_joint_vertical.pdf",
+        out_png="figs_revision/gender_activity_joint_vertical.png",
+        out_pdf="figs_revision/gender_activity_joint_vertical.pdf",
         layout="grid",
         fig_size=(gender_fig_w, gender_fig_h),
         cell_fontsize=16,
@@ -379,8 +416,8 @@ def main() -> None:
         subplot_titles=subplot_titles,
         x_label="Gender",
         y_label="Mode",
-        out_png="figs/gender_mode_joint_vertical.png",
-        out_pdf="figs/gender_mode_joint_vertical.pdf",
+        out_png="figs_revision/gender_mode_joint_vertical.png",
+        out_pdf="figs_revision/gender_mode_joint_vertical.pdf",
         layout="grid",
         fig_size=(gender_fig_w, gender_fig_h * 0.9),
         cell_fontsize=16,

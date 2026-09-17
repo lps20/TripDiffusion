@@ -95,21 +95,32 @@ def _generate_tabddpm(checkpoint: str, num_samples: int, sample_batch_size: int)
 
 
 def _load_ddpm_tf(checkpoint: str, device: torch.device):
-    from model.Transformer_Net import TripDiffusionModel as DDPMTransformerModel
+    from model.EmbeddingDDPM_Net import EmbeddingDDPM
 
     ckpt = torch.load(checkpoint, map_location=device)
-    if ckpt.get("model_type") != "ddpm_transformer":
-        raise ValueError(f"Expected ddpm_transformer checkpoint, got {ckpt.get('model_type')!r}")
+    if ckpt.get("model_type") != "embedding_ddpm":
+        raise ValueError(f"Expected embedding_ddpm checkpoint, got {ckpt.get('model_type')!r}")
 
-    model = DDPMTransformerModel(
-        ckpt["features_info"],
-        ckpt["cond_info"],
-        int(ckpt["T"]),
-        joint_pairs=[],
+    model = EmbeddingDDPM(
+        features_info=ckpt["features_info"],
+        cond_info=ckpt["cond_info"],
+        T=int(ckpt["T"]),
+        d_model=int(ckpt["d_model"]),
+        backbone=str(ckpt["backbone"]),
+        nhead=int(ckpt.get("nhead", 8)),
+        num_layers=int(ckpt.get("num_layers", 4)),
+        mlp_hidden=ckpt.get("mlp_hidden"),
+        dropout=float(ckpt.get("dropout", 0.1)),
+        beta_schedule=str(ckpt.get("beta_schedule", "cosine")),
+        feature_embedding_mode=str(ckpt.get("feature_embedding_mode", "learned")),
+        fixed_codebook_type=str(ckpt.get("fixed_codebook_type", "random")),
+        decode_metric=str(ckpt.get("decode_metric", "dot")),
+        x0_ce_weight=float(ckpt.get("x0_ce_weight", 0.0)),
+        sample_method=str(ckpt.get("sample_method", "ddpm")),
     ).to(device)
     model.load_state_dict(ckpt["state_dict"])
     model.eval()
-    return model
+    return model, ckpt
 
 
 def _generate_ddpm_tf(
@@ -117,28 +128,24 @@ def _generate_ddpm_tf(
     test_df: pd.DataFrame,
     num_samples: int,
     device: torch.device,
+    sample_batch_size: int,
 ) -> pd.DataFrame:
-    import utils.train_utils
+    from model.EmbeddingDDPM_Net import sample_embedding_ddpm
 
-    model = _load_ddpm_tf(checkpoint, device)
+    model, ckpt = _load_ddpm_tf(checkpoint, device)
     match_test = num_samples <= 0
-    generated_samples, _ = utils.train_utils.sample_trip(
+    target_n = len(test_df) if match_test else num_samples
+    generated = sample_embedding_ddpm(
         model=model,
-        df=test_df,
-        num_samples=num_samples,
+        test_df=test_df,
+        feat_cols=[field["name"] for field in ckpt["features_info"]],
+        cond_cols=[field["name"] for field in ckpt["cond_info"]],
+        n_samples=target_n,
         device=device,
+        batch_size=sample_batch_size,
         match_test_one_to_one=match_test,
     )
-
-    rows = []
-    for sample in generated_samples:
-        row = {}
-        for i, col in enumerate(DDPM_COND_COLS):
-            row[col] = int(sample["condition"][i])
-        for i, col in enumerate(DDPM_TRIP_COLS):
-            row[col] = int(sample["trip"][i])
-        rows.append(row)
-    return _sanitize_df_by_schema(pd.DataFrame(rows), FULL_SCHEMA)
+    return _sanitize_df_by_schema(generated, FULL_SCHEMA)
 
 
 def _evaluate(
@@ -219,6 +226,7 @@ def generate_and_evaluate(
                 test_df=test_df,
                 num_samples=0 if num_samples <= 0 else num_samples,
                 device=device,
+                sample_batch_size=sample_batch_size,
             )
         else:
             raise ValueError(f"Unsupported model: {model_name}")
