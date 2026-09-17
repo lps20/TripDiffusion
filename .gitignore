@@ -5,12 +5,24 @@ __pycache__/
 .venv/
 venv/
 
-# Experiments & outputs
+# Experiment artifacts & outputs (regenerate by running the scripts)
 exp/
+outputs/
 figs/
+figs_revision/
 *.log
 
-# Data (large; regenerate via scripts/data/prepare_train_test_split.py)
+# Paper revision working copies (LaTeX sources, reviewer notes, scratch)
+/revision_exp/
+/revision_work/
+/tmp/
+
+# Editor / tooling backups
+*.pre_*
+*.bak
+*.orig
+
+# Data (large; see README "Data" for how to obtain and regenerate)
 /data/
 !data/description.docx
 
@@ -27,3 +39,6 @@ acteval/
 # OS
 .DS_Store
 Thumbs.db
+
+# Local hyper-parameter search scratch for Embedding-DDPM (kept out of the release)
+/scripts/experiments/optimize_embedding_ddpm_*.py
