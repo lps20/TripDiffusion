@@ -822,6 +822,9 @@ def _run_ddpm_transformer(
         nhead=8,
         num_layers=4,
         beta_schedule="cosine",
+        feature_embedding_mode="fixed",
+        fixed_codebook_type="random",
+        decode_metric="cosine",
     ).to(device)
     n_params = sum(p.numel() for p in model.parameters())
     logging.info("Embedding-DDPM (transformer) parameters: %d (%.2f M)", n_params, n_params / 1e6)
@@ -900,6 +903,9 @@ def _run_ddpm_mlp(
         backbone="mlp",
         mlp_hidden=[512, 512, 512],
         beta_schedule="cosine",
+        feature_embedding_mode="fixed",
+        fixed_codebook_type="random",
+        decode_metric="cosine",
     ).to(device)
     n_params = sum(p.numel() for p in model.parameters())
     logging.info("Embedding-DDPM (mlp) parameters: %d (%.2f M)", n_params, n_params / 1e6)

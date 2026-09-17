@@ -65,21 +65,75 @@ class EmbeddingDDPM(nn.Module):
         mlp_hidden: Optional[List[int]] = None,
         dropout: float = 0.1,
         beta_schedule: str = "cosine",
+        feature_embedding_mode: str = "learned",
+        fixed_codebook_type: str = "random",
+        decode_metric: str = "dot",
+        x0_ce_weight: float = 0.0,
+        sample_method: str = "ddpm",
     ):
         super().__init__()
         if backbone not in {"transformer", "mlp"}:
             raise ValueError(f"Unsupported backbone={backbone!r}")
+        if feature_embedding_mode not in {"learned", "fixed"}:
+            raise ValueError(f"Unsupported feature_embedding_mode={feature_embedding_mode!r}")
+        if fixed_codebook_type not in {"random", "structured"}:
+            raise ValueError(f"Unsupported fixed_codebook_type={fixed_codebook_type!r}")
+        if decode_metric not in {"dot", "cosine"}:
+            raise ValueError(f"Unsupported decode_metric={decode_metric!r}")
+        if sample_method not in {"ddpm", "ddim"}:
+            raise ValueError(f"Unsupported sample_method={sample_method!r}")
         self.features_info = list(features_info)
         self.cond_info = list(cond_info)
         self.T = int(T)
         self.d_model = int(d_model)
         self.backbone_type = backbone
+        self.nhead = int(nhead)
+        self.num_layers = int(num_layers)
+        self.dropout = float(dropout)
+        self.mlp_hidden = list(mlp_hidden) if mlp_hidden is not None else None
+        self.beta_schedule = beta_schedule
+        self.feature_embedding_mode = feature_embedding_mode
+        self.fixed_codebook_type = fixed_codebook_type
+        self.decode_metric = decode_metric
+        self.x0_ce_weight = float(x0_ce_weight)
+        self.sample_method = sample_method
         self.feat_names = [f["name"] for f in self.features_info]
         self.num_features = len(self.feat_names)
 
         self.feature_embeddings = nn.ModuleDict(
             {f["name"]: nn.Embedding(f["num_classes"], self.d_model) for f in self.features_info}
         )
+        if self.feature_embedding_mode == "fixed":
+            # DDPM assumes x0 has O(1) variance per coordinate. Fixed spherical
+            # codebooks prevent the epsilon objective from shrinking embeddings
+            # toward zero and keep unseen/rare categories on the same norm.
+            for feature in self.features_info:
+                embedding = self.feature_embeddings[feature["name"]]
+                with torch.no_grad():
+                    if self.fixed_codebook_type == "structured" and feature.get("type") == "ordinal":
+                        positions = torch.arange(
+                            feature["num_classes"], dtype=embedding.weight.dtype
+                        ).unsqueeze(1)
+                        frequencies = torch.arange(
+                            1, self.d_model // 2 + 1, dtype=embedding.weight.dtype
+                        ).unsqueeze(0)
+                        angles = 2.0 * math.pi * positions * frequencies / feature["num_classes"]
+                        codebook = torch.cat([torch.sin(angles), torch.cos(angles)], dim=1)
+                        codebook = codebook[:, : self.d_model]
+                    elif self.fixed_codebook_type == "structured":
+                        random_matrix = torch.randn(
+                            self.d_model,
+                            feature["num_classes"],
+                            dtype=embedding.weight.dtype,
+                        )
+                        codebook = torch.linalg.qr(random_matrix, mode="reduced").Q.t()
+                    else:
+                        codebook = embedding.weight
+                    codebook = codebook - codebook.mean(dim=0, keepdim=True)
+                    embedding.weight.copy_(
+                        F.normalize(codebook, dim=-1) * math.sqrt(self.d_model)
+                    )
+                embedding.weight.requires_grad_(False)
         self.cond_embeddings = nn.ModuleDict(
             {c["name"]: nn.Embedding(c["num_classes"], 16) for c in self.cond_info}
         )
@@ -157,7 +211,11 @@ class EmbeddingDDPM(nn.Module):
         outs = []
         for i, name in enumerate(self.feat_names):
             weight = self.feature_embeddings[name].weight  # (K, D)
-            logits = torch.matmul(x_emb[:, i, :], weight.t())  # (B, K)
+            query = x_emb[:, i, :]
+            if self.decode_metric == "cosine":
+                query = F.normalize(query, dim=-1)
+                weight = F.normalize(weight, dim=-1)
+            logits = torch.matmul(query, weight.t())  # (B, K)
             if temperature and temperature > 0:
                 probs = F.softmax(logits / temperature, dim=-1)
                 outs.append(torch.multinomial(probs, num_samples=1).squeeze(1))
@@ -193,7 +251,24 @@ class EmbeddingDDPM(nn.Module):
         x0 = self.encode_features(x_ids)
         x_t, noise = self.q_sample(x0, t)
         pred = self.predict_eps(x_t, cond_ids, t)
-        return F.mse_loss(pred, noise)
+        loss = F.mse_loss(pred, noise)
+        if self.x0_ce_weight > 0:
+            sa = self.sqrt_alpha_bar[t].view(-1, 1, 1).clamp(min=1e-4)
+            so = self.sqrt_one_minus_alpha_bar[t].view(-1, 1, 1)
+            x0_pred = (x_t - so * pred) / sa
+            ce_losses = []
+            for i, name in enumerate(self.feat_names):
+                query = F.normalize(x0_pred[:, i, :], dim=-1)
+                codebook = F.normalize(self.feature_embeddings[name].weight, dim=-1)
+                logits = 10.0 * torch.matmul(query, codebook.t())
+                ce_losses.append(F.cross_entropy(logits, x_ids[:, i], reduction="none"))
+            ce_per_row = torch.stack(ce_losses, dim=1).mean(dim=1)
+            # Classification is meaningful when x_t retains signal. Weighting
+            # by alpha_bar avoids forcing majority-class guesses at pure noise.
+            signal_weight = self.alpha_bar[t].detach()
+            ce_loss = (ce_per_row * signal_weight).sum() / signal_weight.sum().clamp(min=1e-6)
+            loss = loss + self.x0_ce_weight * ce_loss
+        return loss
 
     @torch.no_grad()
     def p_sample(self, x_t: torch.Tensor, cond_ids: torch.Tensor, t: int) -> torch.Tensor:
@@ -213,6 +288,24 @@ class EmbeddingDDPM(nn.Module):
         return mean + torch.sqrt(self.posterior_variance[t]) * noise
 
     @torch.no_grad()
+    def ddim_sample(self, x_t: torch.Tensor, cond_ids: torch.Tensor, t: int) -> torch.Tensor:
+        """Deterministic DDIM step; useful when the reverse chain has few steps."""
+        bsz = x_t.size(0)
+        t_batch = torch.full((bsz,), t, device=x_t.device, dtype=torch.long)
+        eps = self.predict_eps(x_t, cond_ids, t_batch)
+        alpha_bar_t = self.alpha_bar[t]
+        x0_pred = (
+            x_t - torch.sqrt(1.0 - alpha_bar_t) * eps
+        ) / torch.sqrt(alpha_bar_t).clamp(min=1e-8)
+        if t == 0:
+            return x0_pred
+        alpha_bar_prev = self.alpha_bar[t - 1]
+        return (
+            torch.sqrt(alpha_bar_prev) * x0_pred
+            + torch.sqrt(1.0 - alpha_bar_prev) * eps
+        )
+
+    @torch.no_grad()
     def sample(
         self,
         cond_ids: torch.Tensor,
@@ -226,7 +319,10 @@ class EmbeddingDDPM(nn.Module):
         if progress:
             steps = tqdm(list(steps), desc="Embedding-DDPM sample", leave=False)
         for t in steps:
-            x = self.p_sample(x, cond_ids, t)
+            if self.sample_method == "ddim":
+                x = self.ddim_sample(x, cond_ids, t)
+            else:
+                x = self.p_sample(x, cond_ids, t)
         return self.decode_features(x, temperature=temperature)
 
 
@@ -292,6 +388,16 @@ def train_embedding_ddpm(
                         "cond_info": model.cond_info,
                         "T": model.T,
                         "d_model": model.d_model,
+                        "nhead": model.nhead,
+                        "num_layers": model.num_layers,
+                        "dropout": model.dropout,
+                        "mlp_hidden": model.mlp_hidden,
+                        "beta_schedule": model.beta_schedule,
+                        "feature_embedding_mode": model.feature_embedding_mode,
+                        "fixed_codebook_type": model.fixed_codebook_type,
+                        "decode_metric": model.decode_metric,
+                        "x0_ce_weight": model.x0_ce_weight,
+                        "sample_method": model.sample_method,
                     },
                     model_save_path,
                 )
