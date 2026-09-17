@@ -505,7 +505,7 @@ def _build_datgan_metadata(continuous_time: bool = True) -> Dict[str, Dict[str, 
 
 def _build_datgan_cascade_dag():
     """
-    DAG aligned with HCD v2 cascade:
+    DAG aligned with D3PM-SC3T cascade:
       demo -> act -> (loc, time) -> mode
     with act->time/loc and loc->mode emphasis.
     """
@@ -1276,7 +1276,7 @@ if __name__ == "__main__":
         type=str,
         default="cascade",
         choices=["cascade", "linear"],
-        help="DATGAN DAG: cascade matches HCD (demo->act->loc/time->mode); linear uses column order.",
+        help="DATGAN DAG: cascade matches D3PM-SC3T (demo->act->loc/time->mode); linear uses column order.",
     )
     parser.add_argument(
         "--datgan_continuous_time",

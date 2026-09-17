@@ -1,4 +1,4 @@
-"""Re-run 1:1 full-test generation and metrics for trained HCD v2 checkpoints."""
+"""Re-run 1:1 full-test generation and metrics for trained D3PM-SC3T checkpoints."""
 
 import argparse
 import copy
@@ -15,7 +15,7 @@ from project_paths import setup
 
 setup()
 
-from scripts.train.run_hcd_v2 import run_once
+from scripts.train.run_d3pm_sc3t import run_once
 from utils.multi_seed import aggregate_headline_metrics, extract_headline_metrics
 
 
@@ -36,7 +36,7 @@ def _parse_seed(seed_dir: Path) -> int:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Re-evaluate saved HCD v2 models with 1:1 full-test generation.")
+    parser = argparse.ArgumentParser(description="Re-evaluate saved D3PM-SC3T models with 1:1 full-test generation.")
     parser.add_argument(
         "--root",
         type=str,

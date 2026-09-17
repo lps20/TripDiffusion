@@ -1,4 +1,4 @@
-"""Re-generate and evaluate revision baselines with HCD-aligned eval settings."""
+"""Re-generate and evaluate revision baselines with D3PM-SC3T-aligned eval settings."""
 
 from __future__ import annotations
 
@@ -36,7 +36,7 @@ def _parse_seed(seed_dir: Path) -> int:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Re-generate/evaluate CTGAN, DDPM-TF, TabDDPM with HCD-aligned full-test eval."
+        description="Re-generate/evaluate CTGAN, DDPM-TF, TabDDPM with D3PM-SC3T-aligned full-test eval."
     )
     parser.add_argument(
         "--models",
@@ -57,7 +57,7 @@ def main() -> None:
         "--num_samples",
         type=int,
         default=0,
-        help="Generated rows per seed. 0 = full test size (HCD revision protocol).",
+        help="Generated rows per seed. 0 = full test size (D3PM-SC3T protocol).",
     )
     parser.add_argument("--sample_batch_size", type=int, default=5000)
     parser.add_argument("--eval_only", action="store_true", help="Skip generation if *_gene.csv exists.")

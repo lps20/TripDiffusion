@@ -1,3 +1,10 @@
+"""D3PM-SC3T: soft-causal three-stream denoiser for discrete diffusion.
+
+A shared transformer encodes all variables jointly, then soft-causal adapter
+blocks refine three behavioural streams -- activity, space-time, and mode.
+The streams are updated in parallel with learned gates by default, or as a true
+sequential cascade when a hard stream order is requested.
+"""
 import torch
 import torch.nn as nn
 

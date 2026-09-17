@@ -1,3 +1,4 @@
+"""Train D3PM-SC3T and generate conditional synthetic activity-travel records."""
 import sys
 from pathlib import Path
 
@@ -22,7 +23,7 @@ import json
 import time
 import copy
 
-from model.HCD_Net_v2 import TripDiffusionModel
+from model.D3PM_SC3T_Net import TripDiffusionModel
 import utils.train_utils, utils.test_utils
 from utils.multi_seed import (
     add_multiseed_arguments,
@@ -177,7 +178,7 @@ def run_once(args, seed, exp_dir):
         import math as _math
 
         logging.info(
-            "Gates FROZEN at init | act=%.3f (α≈%.3f) | st=%.3f (α≈%.3f) | mode=%.3f (α≈%.3f)",
+            "Gates FROZEN at init | act=%.3f (alpha~%.3f) | st=%.3f (alpha~%.3f) | mode=%.3f (alpha~%.3f)",
             args.gate_init_act,
             1.0 / (1.0 + _math.exp(-args.gate_init_act)),
             args.gate_init_st,
@@ -187,13 +188,13 @@ def run_once(args, seed, exp_dir):
         )
     if args.st_cascade:
         logging.info(
-            "Using HCD v2 ST cascade chain=%s | phase1=%s | phase2=%s",
+            "Using D3PM-SC3T ST cascade chain=%s | phase1=%s | phase2=%s",
             args.st_cascade_chain,
             getattr(model, "st_cascade_phase1_names", None),
             getattr(model, "st_cascade_phase2_names", None),
         )
     else:
-        logging.info("Using HCD v2: shared transformer + soft causal adapters.")
+        logging.info("Using D3PM-SC3T: shared transformer + soft causal adapters.")
 
     if args.checkpoint:
         logging.info("Loading model checkpoint from %s", args.checkpoint)
@@ -367,7 +368,7 @@ def main(args):
         format="%(asctime)s %(levelname)s: %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
-    logging.info("Running HCD v2 across %d seeds: %s", len(seeds), seeds)
+    logging.info("Running D3PM-SC3T across %d seeds: %s", len(seeds), seeds)
 
     single_args = copy.copy(args)
     single_args.metrics_file = None
@@ -376,14 +377,14 @@ def main(args):
         seeds=seeds,
         run_once=run_once,
         output_root=output_root,
-        experiment_name="HCD_v2",
+        experiment_name="D3PM_SC3T",
     )
     print("Multi-seed experiment completed. Summary:", result["summary"])
     print("Artifacts saved under:", output_root)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train HCD v2 TripDiffusionModel and generate samples.")
+    parser = argparse.ArgumentParser(description="Train D3PM-SC3T TripDiffusionModel and generate samples.")
     parser.add_argument("--traindata", type=str, default="data/train_data.csv", help="Path to training dataset CSV file")
     parser.add_argument("--testdata", type=str, default="data/test_data.csv", help="Path to testing dataset CSV file")
     parser.add_argument("--patience", type=int, default=10, help="Number of epochs to wait for improvement before early stopping.")
@@ -421,7 +422,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--freeze_gates",
         action="store_true",
-        help="Freeze soft-causal gates at gate_init (ablate learnable soft gating; α=sigmoid(init)).",
+        help="Freeze soft-causal gates at gate_init (ablate learnable soft gating; alpha=sigmoid(init)).",
     )
     parser.add_argument(
         "--feature_loss_weights",

@@ -154,7 +154,7 @@ def main() -> None:
         {"name": "trip_time_num_6", "type": "ordinal", "num_classes": 241},
     ]
 
-    # Keep trip list order identical to features_info (HCD revision order).
+    # Keep trip list order identical to features_info (D3PM-SC3T feature order).
     eval_trip_cols = [f["name"] for f in features_info]
     truth_trips = truth_df[eval_trip_cols].astype(int).values.tolist()
     generated_trips = generated_df[eval_trip_cols].astype(int).values.tolist()

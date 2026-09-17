@@ -238,7 +238,7 @@ def generate_and_evaluate(
         generated_df = pd.read_csv(gene_csv)
         generated_df = _sanitize_df_by_schema(generated_df, FULL_SCHEMA)
 
-    # Feature-index order MUST match FEATURES_INFO (HCD revision order).
+    # Feature-index order MUST match FEATURES_INFO (D3PM-SC3T feature order).
     # TRIP_COLUMNS from tabular baselines uses a different column order and would
     # mis-assign per-feature JSD / mean_marginal_jsd if used here.
     eval_trip_cols = [f["name"] for f in FEATURES_INFO]
@@ -300,7 +300,7 @@ def main() -> None:
         "--num_samples",
         type=int,
         default=0,
-        help="Number of generated rows. 0 uses full test size (534445), matching HCD revision eval.",
+        help="Number of generated rows. 0 uses full test size (534445), matching the D3PM-SC3T evaluation protocol.",
     )
     parser.add_argument("--sample_batch_size", type=int, default=5000)
     parser.add_argument("--train_data", type=str, default="data/train_data.csv")

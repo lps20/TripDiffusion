@@ -1,4 +1,4 @@
-"""Re-generate and evaluate TVAE / DATGAN with HCD-aligned full-test eval."""
+"""Re-generate and evaluate TVAE / DATGAN with D3PM-SC3T-aligned full-test eval."""
 
 from __future__ import annotations
 

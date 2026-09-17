@@ -1,4 +1,4 @@
-"""Re-evaluate saved HCD v2 checkpoints with joint-pair Gibbs sampling at inference."""
+"""Re-evaluate saved D3PM-SC3T checkpoints with joint-pair Gibbs sampling at inference."""
 
 import argparse
 import json
@@ -14,7 +14,7 @@ from project_paths import setup
 
 setup()
 
-from scripts.train.run_hcd_v2 import run_once
+from scripts.train.run_d3pm_sc3t import run_once
 from utils.multi_seed import aggregate_headline_metrics, extract_headline_metrics
 
 
@@ -36,7 +36,7 @@ def _parse_seed(seed_dir: Path) -> int:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Re-evaluate HCD v2 with joint-pair Gibbs sampling (Step A, no gate change)."
+        description="Re-evaluate D3PM-SC3T with joint-pair Gibbs sampling (Step A, no gate change)."
     )
     parser.add_argument(
         "--root",
