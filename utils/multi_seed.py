@@ -1,4 +1,4 @@
-"""Utilities for multi-seed training/evaluation with mean ± std reporting."""
+"""Utilities for multi-seed training/evaluation with mean +/- std reporting."""
 
 from __future__ import annotations
 
@@ -106,7 +106,7 @@ def format_mean_std(mean: Optional[float], std: Optional[float], precision: int 
         return "N/A"
     if std is None or std == 0.0:
         return f"{mean:.{precision}f}"
-    return f"{mean:.{precision}f} ± {std:.{precision}f}"
+    return f"{mean:.{precision}f} +/- {std:.{precision}f}"
 
 
 def aggregate_headline_metrics(per_seed_rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:

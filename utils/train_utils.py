@@ -355,7 +355,7 @@ def train_model(model, optimizer, dataset, features_info,
                 ce_loss = 0.0
                 vb_loss = 0.0
 
-                # 3) per‐feature losses
+                # 3) per-feature losses
                 for feat_index, feat in enumerate(features_info):
                     name = feat["name"]
                     feat_w = float(feature_loss_weights.get(name, 1.0))
@@ -385,7 +385,7 @@ def train_model(model, optimizer, dataset, features_info,
                     # 3) do batched mat-mul: (bsz,1,K) @ (bsz,K,K) -> (bsz,1,K) -> (bsz,K)
                     probs_xtm1 = torch.bmm(probs_x0.unsqueeze(1), M_batch).squeeze(1)
 
-                    # 4) turn back into “logits” and cross-entropy against sampled x_{t-1}
+                    # 4) turn back into "logits" and cross-entropy against sampled x_{t-1}
                     logits_xtm1 = torch.log(probs_xtm1 + 1e-8)        # (bsz, K)
                     target_xtm1 = x_t_minus_1[:, feat_index]          # (bsz,)
                     vb_loss += feat_w * F.cross_entropy(logits_xtm1, target_xtm1)
@@ -433,7 +433,7 @@ def train_model(model, optimizer, dataset, features_info,
             patience_counter = 0
             msg += " (New best model saved!)"
             
-            # 4. 保存模型状态
+            # 4. persist the model state
             if model_save_path:
                 _atomic_torch_save(model.state_dict(), model_save_path)
         else:
@@ -481,7 +481,7 @@ def sample_trip(model, cond_tensor,device):
             # prepare timestep tensor
             t_tensor = torch.full((1,), t, device=device, dtype=torch.long)
 
-            # 1) model forward → logits for p(x0 | xt)
+            # 1) model forward -> logits for p(x0 | xt)
             logits = model(x_t, cond_tensor.unsqueeze(0).to(device), t_tensor)
             # convert to probabilities, squeeze batch
             probs = {
@@ -501,7 +501,7 @@ def sample_trip(model, cond_tensor,device):
                 # p_theta(x0 | x_t = i)
                 p_theta = probs[name]              # (K,)
 
-                # fetch one‐step kernels
+                # fetch one-step kernels
                 Q_t       = model.transitions[name][t-1].to(device)    # (K_j, K_i)
                 Q_bar_tm1 = model.cum_transitions[name][t-1].to(device)# (K_z, K_j)
                 Q_bar_t   = model.cum_transitions[name][t].to(device)  # (K_z, K_i)
@@ -514,7 +514,7 @@ def sample_trip(model, cond_tensor,device):
                 # full posterior: (K_z, K_j, K_i)
                 M_all = num / denom
 
-                # slice out the current x_t = i column → (K_z, K_j)
+                # slice out the current x_t = i column -> (K_z, K_j)
                 M_slice = M_all[:, :, i]
 
                 # weight[j] = sum_z p_theta[z] * M_slice[z, j]

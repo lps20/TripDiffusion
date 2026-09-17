@@ -220,13 +220,13 @@ def format_metric_cell(value, sci_threshold_low=1e-2, sci_threshold_high=1e2):
     only when magnitude is very small or very large, with one consistent rule.
     """
     if value is None:
-        return "—"
+        return "-"
     try:
         v = float(value)
     except (TypeError, ValueError):
         return str(value)
     if np.isnan(v):
-        return "—"
+        return "-"
     if v == 0.0:
         return "0.0000"
     av = abs(v)
