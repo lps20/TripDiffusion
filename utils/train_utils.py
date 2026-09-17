@@ -4,9 +4,26 @@ import torch.nn.functional as F
 import pandas as pd
 import numpy as np
 import logging
+import os
+import time
 from tqdm import tqdm
 
 from utils.data_encoding import normalize_category_values
+
+
+def _atomic_torch_save(state_dict, path, retries=5):
+    """Avoid transient Windows locks while replacing frequently updated checkpoints."""
+    target = os.fspath(path)
+    tmp = f"{target}.tmp.{os.getpid()}"
+    torch.save(state_dict, tmp)
+    for attempt in range(retries):
+        try:
+            os.replace(tmp, target)
+            return
+        except PermissionError:
+            if attempt + 1 == retries:
+                raise
+            time.sleep(0.5 * (attempt + 1))
 
 def generate_synthetic_trips(num_samples):
     """
@@ -418,7 +435,7 @@ def train_model(model, optimizer, dataset, features_info,
             
             # 4. 保存模型状态
             if model_save_path:
-                torch.save(model.state_dict(), model_save_path)
+                _atomic_torch_save(model.state_dict(), model_save_path)
         else:
             patience_counter += 1
             msg += f" (Patience: {patience_counter}/{patience})"
