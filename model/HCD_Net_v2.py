@@ -89,11 +89,25 @@ class SoftCausalAdapterBlock(nn.Module):
     Global shared feature tokens are always available in each stream.
     """
 
-    def __init__(self, d_model, nhead, dropout=0.2, gate_init=None, st_cascade=False, st_loc_chain_idx=None, st_time_chain_idx=None, hard_stream_cascade=False):
+    def __init__(
+        self,
+        d_model,
+        nhead,
+        dropout=0.2,
+        gate_init=None,
+        st_cascade=False,
+        st_loc_chain_idx=None,
+        st_time_chain_idx=None,
+        hard_stream_cascade=False,
+        stream_order=("act", "st", "mode"),
+    ):
         super().__init__()
         gate_init = gate_init or {}
         self.st_cascade = st_cascade
         self.hard_stream_cascade = bool(hard_stream_cascade)
+        self.stream_order = tuple(stream_order)
+        if set(self.stream_order) != {"act", "st", "mode"} or len(self.stream_order) != 3:
+            raise ValueError(f"stream_order must be a permutation of act,st,mode; got {self.stream_order}")
         self.st_loc_chain_idx = st_loc_chain_idx or []
         self.st_time_chain_idx = st_time_chain_idx or []
         self.act_self = nn.MultiheadAttention(d_model, nhead, batch_first=True, dropout=dropout)
@@ -191,28 +205,31 @@ class SoftCausalAdapterBlock(nn.Module):
 
     def forward(self, h_act, h_st, h_mode, h_cond, h_shared):
         if self.hard_stream_cascade:
-            # True stream-level hard cascade: act -> st -> mode (each sees updated upstream).
-            act_ctx = torch.cat([h_cond, h_shared], dim=1)
-            act_new = self._update_stream(
-                h_act, self.act_self, self.act_cross, self.act_ffn, self.act_norm1, self.act_norm2, self.act_norm3, act_ctx
-            )
-            h_act = act_new
-
-            st_ctx = torch.cat([h_cond, h_shared, h_act], dim=1)
-            if self.st_cascade:
-                st_new = self._update_st_cascade(h_st, st_ctx)
-            else:
-                st_new = self._update_stream(
-                    h_st, self.st_self, self.st_cross, self.st_ffn, self.st_norm1, self.st_norm2, self.st_norm3, st_ctx
-                )
-            h_st = st_new
-
-            mode_ctx = torch.cat([h_cond, h_shared, h_act, h_st], dim=1)
-            mode_new = self._update_stream(
-                h_mode, self.mode_self, self.mode_cross, self.mode_ffn, self.mode_norm1, self.mode_norm2, self.mode_norm3, mode_ctx
-            )
-            h_mode = mode_new
-            return h_act, h_st, h_mode
+            # True hard cascade: each stream sees all previously updated streams.
+            states = {"act": h_act, "st": h_st, "mode": h_mode}
+            updated = []
+            for stream in self.stream_order:
+                ctx = torch.cat([h_cond, h_shared, *[states[name] for name in updated]], dim=1)
+                x = states[stream]
+                if stream == "act":
+                    states[stream] = self._update_stream(
+                        x, self.act_self, self.act_cross, self.act_ffn,
+                        self.act_norm1, self.act_norm2, self.act_norm3, ctx
+                    )
+                elif stream == "st" and self.st_cascade:
+                    states[stream] = self._update_st_cascade(x, ctx)
+                elif stream == "st":
+                    states[stream] = self._update_stream(
+                        x, self.st_self, self.st_cross, self.st_ffn,
+                        self.st_norm1, self.st_norm2, self.st_norm3, ctx
+                    )
+                else:
+                    states[stream] = self._update_stream(
+                        x, self.mode_self, self.mode_cross, self.mode_ffn,
+                        self.mode_norm1, self.mode_norm2, self.mode_norm3, ctx
+                    )
+                updated.append(stream)
+            return states["act"], states["st"], states["mode"]
 
         # Soft / parallel causal adapters (default): contexts use pre-update streams, then gated residual.
         act_ctx = torch.cat([h_cond, h_shared], dim=1)
@@ -250,6 +267,7 @@ class TripDiffusionModel(nn.Module):
         st_cascade=False,
         st_cascade_chain="loc_then_time",
         hard_stream_cascade=False,
+        stream_order="act_st_mode",
         use_joint_heads=True,
         d_model=128,
         shared_layers=2,
@@ -266,6 +284,9 @@ class TripDiffusionModel(nn.Module):
         self.st_cascade = st_cascade
         self.st_cascade_chain = st_cascade_chain if st_cascade else None
         self.hard_stream_cascade = bool(hard_stream_cascade)
+        self.stream_order = tuple(stream_order.split("_"))
+        if set(self.stream_order) != {"act", "st", "mode"} or len(self.stream_order) != 3:
+            raise ValueError(f"Invalid stream_order={stream_order!r}")
         self.use_joint_heads = use_joint_heads
         self.freeze_gates = bool(freeze_gates)
 
@@ -335,6 +356,7 @@ class TripDiffusionModel(nn.Module):
                     st_loc_chain_idx=self.st_loc_chain_idx,
                     st_time_chain_idx=self.st_time_chain_idx,
                     hard_stream_cascade=self.hard_stream_cascade,
+                    stream_order=self.stream_order,
                 )
                 for _ in range(self.causal_layers)
             ]

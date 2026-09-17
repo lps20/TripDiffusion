@@ -160,6 +160,7 @@ def run_once(args, seed, exp_dir):
         st_cascade=args.st_cascade,
         st_cascade_chain=args.st_cascade_chain,
         hard_stream_cascade=args.hard_stream_cascade,
+        stream_order=args.stream_order,
         use_joint_heads=not args.no_joint_heads,
         d_model=d_model,
         shared_layers=shared_layers,
@@ -168,7 +169,10 @@ def run_once(args, seed, exp_dir):
     num_params = sum(p.numel() for p in model.parameters())
     logging.info("Model parameters: %d (%.2f M)", num_params, num_params / 1e6)
     if args.hard_stream_cascade:
-        logging.info("Using HARD stream cascade: act -> st -> mode (sequential, full replace, no soft gates).")
+        logging.info(
+            "Using HARD stream cascade: %s (sequential, full replace, no soft gates).",
+            args.stream_order.replace("_", " -> "),
+        )
     if args.freeze_gates:
         import math as _math
 
@@ -311,6 +315,7 @@ def run_once(args, seed, exp_dir):
         "st_cascade": bool(args.st_cascade),
         "st_cascade_chain": args.st_cascade_chain if args.st_cascade else None,
         "hard_stream_cascade": bool(args.hard_stream_cascade),
+        "stream_order": args.stream_order if args.hard_stream_cascade else "parallel_soft",
         "freeze_gates": bool(args.freeze_gates),
         "gate_init_act": float(args.gate_init_act),
         "gate_init_st": float(args.gate_init_st),
@@ -480,6 +485,20 @@ if __name__ == "__main__":
         "--hard_stream_cascade",
         action="store_true",
         help="Hard stream cascade: update act->st->mode sequentially with full replace (no soft gates).",
+    )
+    parser.add_argument(
+        "--stream_order",
+        type=str,
+        default="act_st_mode",
+        choices=[
+            "act_st_mode",
+            "mode_st_act",
+            "st_act_mode",
+            "act_mode_st",
+            "st_mode_act",
+            "mode_act_st",
+        ],
+        help="Stream permutation used by --hard_stream_cascade.",
     )
     parser.add_argument(
         "--st_cascade_chain",
