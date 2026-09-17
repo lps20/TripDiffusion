@@ -1,8 +1,11 @@
-# TripDiffusion
+# Soft Hierarchical Diffusion for Conditional Tabular Data Generation
 
-A discrete diffusion model for conditional generation of synthetic activity-travel
-records, with a hierarchical causal-cascade denoiser (HCD) over three behavioural
-streams (activity, space-time, mode).
+### Application to Travel Survey Entries
+
+**D3PM-SC3T** is a discrete denoising diffusion model for conditional generation of
+synthetic activity-travel records. Its denoiser couples a shared transformer with
+*soft-causal* adapter blocks over three behavioural streams — activity, space-time,
+and mode — so the model can express a behavioural ordering without hard-wiring one.
 
 Given four socio-demographic conditioning variables, the model generates the eight
 categorical / ordinal variables that describe one activity-travel entry:
@@ -11,9 +14,6 @@ categorical / ordinal variables that describe one activity-travel entry:
 | --- | --- |
 | conditioning (given) | `relation`, `sex`, `age_code`, `job_type` |
 | generated | `start_type`, `start_zcode_num`, `start_time_num_6`, `act_num`, `mode_num`, `trip_time_num_6`, `end_type`, `end_zcode_num` |
-
-This repository contains the model code, the baselines it is compared against, and
-the scripts that reproduce the experiments reported in the paper.
 
 ---
 
@@ -66,12 +66,12 @@ expects by default.
 
 ---
 
-## Quick start
+## Training
 
-Train the main model (HCD v2) over three seeds and evaluate:
+Train D3PM-SC3T over three seeds and evaluate:
 
 ```bash
-python scripts/train/run_hcd_v2.py \
+python scripts/train/run_d3pm_sc3t.py \
     --traindata data/train_data.csv \
     --testdata data/test_data.csv \
     --num_seeds 3
@@ -82,28 +82,21 @@ Each run writes `model.pth`, `training.log`, `generated_samples.csv` and
 
 Common flags: `--epochs` (100), `--batch_size` (64), `--lr` (1e-3), `--T`
 (diffusion steps, 10), `--lambda_weight` (1.0), `--num_samples`, `--exp_dir`.
+Run with `--help` for the full list.
 
 ### Cascade structure
 
-The causal structure of the denoiser is controlled by these flags:
+The causal structure of the denoiser is set by these flags:
 
 | flag | effect |
 | --- | --- |
 | *(default)* | soft-gated parallel streams — all three streams updated together with learned gates |
 | `--hard_stream_cascade` | true sequential cascade; each stream conditions on the already-updated upstream streams |
-| `--stream_order` | stream permutation for the hard cascade (`act_st_mode` default, all six permutations supported) |
+| `--stream_order` | stream permutation for the hard cascade (`act_st_mode` default; all six permutations supported) |
 | `--st_cascade` | two-phase cascade *within* the space-time stream |
-| `--st_cascade_chain` | ordering preset for that sub-chain (`loc_then_time` default; see `ST_CASCADE_PRESETS` in [model/HCD_Net_v2.py](model/HCD_Net_v2.py)) |
-| `--no_joint_heads` | drop the joint output heads (ablation) |
-
-### Other diffusion variants
-
-```bash
-python scripts/train/run.py             # original HCD
-python scripts/train/run_transformer.py # plain transformer denoiser
-python scripts/train/run_absorbing.py   # absorbing-state discrete diffusion
-python scripts/train/run_mlp.py         # MLP denoiser
-```
+| `--st_cascade_chain` | ordering preset for that sub-chain (`loc_then_time` default; see `ST_CASCADE_PRESETS` in [model/D3PM_SC3T_Net.py](model/D3PM_SC3T_Net.py)) |
+| `--no_joint_heads` | drop the joint output heads |
+| `--freeze_gates` / `--gate_init_*` | fix the soft gates at their initial values, to isolate the effect of soft gating |
 
 ---
 
@@ -124,8 +117,8 @@ Available `--models`: `ctgan`, `tvae`, `vae`, `datgan`, `tabddpm`, `tabddpm_tf`,
   (from <https://github.com/yandex-research/tab-ddpm>).
 - **Embedding-DDPM** (`ddpm_tf`, `ddpm_mlp`) is a continuous-embedding DDPM over the
   same categorical schema — see [model/EmbeddingDDPM_Net.py](model/EmbeddingDDPM_Net.py).
-  It uses a fixed spherical codebook with cosine decoding, which keeps the
-  epsilon objective from collapsing the embedding norms.
+  It uses a fixed spherical codebook with cosine decoding, which keeps the epsilon
+  objective from collapsing the embedding norms.
 - **Sequential econometric baseline** — a classical stage-wise generator built from
   multinomial logit and proportional-odds ordered logit models, in
   [scripts/baselines/sequential_econometric_baseline.py](scripts/baselines/sequential_econometric_baseline.py).
@@ -154,39 +147,15 @@ Reported metrics ([utils/test_utils.py](utils/test_utils.py)):
   tested on real data, reported as a TSTR/TRTR F1 ratio
   ([utils/mnl_mode_choice.py](utils/mnl_mode_choice.py)).
 
-Figures:
+To regenerate samples and metrics from checkpoints you have already trained, without
+retraining, use the re-evaluation helpers in [scripts/eval/](scripts/eval/):
 
 ```bash
-python scripts/plot/plot_marginal_distributions.py
-python scripts/plot/plot_age_gender_joint_comparison.py
+python scripts/eval/reeval_revision_d3pm_sc3t.py          # D3PM-SC3T checkpoints
+python scripts/eval/reeval_revision_baselines.py          # CTGAN / DDPM-TF / TabDDPM
+python scripts/eval/reeval_revision_tvae_datgan.py        # TVAE / DATGAN
+python scripts/eval/reeval_joint_sampling_d3pm_sc3t.py    # joint-pair Gibbs sampling
 ```
-
----
-
-## Reproducing the paper experiments
-
-All experiment runners live under [scripts/experiments/](scripts/experiments/) and
-write JSON/CSV summaries next to their artefacts.
-
-| study | command |
-| --- | --- |
-| Stream ablation (shared-only / soft / hard), paired 10k subsets | `python scripts/experiments/run_stream_ablation_10k.py` |
-| Interaction analysis for the above | `python scripts/experiments/analyze_stream_ablation_interaction.py` |
-| Minimum stream & ST ordering study | `python scripts/experiments/run_minimum_ordering.py` |
-| Cascade-chain sensitivity | `python scripts/experiments/run_cascade_chain_20k.py` |
-| Diffusion-step (T) sensitivity | `python scripts/experiments/run_hcd_v2_t_sensitivity.py` |
-| Joint-head ablation | `python scripts/experiments/run_hcd_no_joint_heads.py` |
-| Sample-size / seed robustness | `python scripts/experiments/run_size_seed_robustness.py` |
-| Sequential econometric baseline (20k / full / by size) | `python scripts/experiments/run_sequential_econometric_20k.py` |
-| Embedding-DDPM (full / by size) | `python scripts/experiments/run_embedding_ddpm_full_fixed.py` |
-| Privacy risk — exact matches, DCR/NNDR, NN membership inference | `python scripts/experiments/run_privacy_assessment.py` |
-| Augmentation value — synthetic data as training augmentation for mode choice | `python scripts/experiments/run_augmentation_assessment.py` |
-
-Most runners accept `--seeds`, `--epochs` and an output-root flag; run any of them
-with `--help` for the full list.
-
-Re-evaluation helpers for already-trained checkpoints are under
-[scripts/eval/](scripts/eval/) (`reeval_*.py`, `generate_and_eval_*_checkpoint.py`).
 
 ---
 
@@ -194,29 +163,26 @@ Re-evaluation helpers for already-trained checkpoints are under
 
 ```
 .
-├── model/                    # denoiser architectures
-│   ├── HCD_Net_v2.py         #   main model: soft/hard stream cascade + ST sub-chain
-│   ├── HCD_Net.py            #   original HCD
-│   ├── HCD_Net_absorbing.py  #   absorbing-state variant
-│   ├── EmbeddingDDPM_Net.py  #   continuous-embedding DDPM
-│   ├── Transformer_Net.py
-│   └── Net.py
-├── utils/                    # training loop, metrics, encodings, multi-seed driver
+├── model/
+│   ├── D3PM_SC3T_Net.py      # the model: shared transformer + soft-causal streams
+│   └── EmbeddingDDPM_Net.py  # continuous-embedding DDPM baseline
+├── utils/
+│   ├── train_utils.py        # diffusion training loop
+│   ├── test_utils.py         # fidelity, validity, and TSTR metrics
+│   ├── mnl_mode_choice.py    # MNL mode-choice model used for behavioural TSTR
+│   ├── data_encoding.py      # category normalisation and encoding
+│   └── multi_seed.py         # multi-seed driver and aggregation
 ├── scripts/
 │   ├── data/                 # train/test split
-│   ├── train/                # training entry points
+│   ├── train/                # training entry point
 │   ├── baselines/            # CTGAN / TVAE / DATGAN / TabDDPM / econometric
-│   ├── eval/                 # standalone evaluation & re-evaluation
-│   ├── experiments/          # ablations, robustness, privacy, augmentation
-│   ├── plot/                 # figures
-│   └── revision/             # dataset descriptive statistics
-├── batch/                    # Windows/Linux parameter-sweep scripts
+│   └── eval/                 # evaluation and checkpoint re-evaluation
 ├── data/                     # not tracked — see "Data" above
 └── exp/                      # not tracked — run outputs
 ```
 
 `data/`, `exp/`, `outputs/` and `figs*/` are gitignored; everything under them is
-regenerated by the scripts above.
+produced by the scripts above.
 
 ---
 
