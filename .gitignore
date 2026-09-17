@@ -12,7 +12,9 @@ figs/
 figs_revision/
 *.log
 
-# Paper revision working copies (LaTeX sources, reviewer notes, scratch)
+# Superseded model variants, research-process scripts, and paper-revision
+# working copies. Kept locally, excluded from the released repository.
+/backup/
 /revision_exp/
 /revision_work/
 /tmp/
@@ -39,6 +41,3 @@ acteval/
 # OS
 .DS_Store
 Thumbs.db
-
-# Local hyper-parameter search scratch for Embedding-DDPM (kept out of the release)
-/scripts/experiments/optimize_embedding_ddpm_*.py
