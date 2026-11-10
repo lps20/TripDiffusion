@@ -29,6 +29,15 @@ def _cosine_beta_schedule(T: int, s: float = 0.008) -> torch.Tensor:
     return betas.clamp(min=1e-5, max=0.999).float()
 
 
+def _shift_betas(betas: torch.Tensor, shift: float) -> torch.Tensor:
+    """Shift a schedule in log-SNR space: logSNR'(t) = logSNR(t) - 2 log(shift)."""
+    alpha_bar = torch.cumprod(1.0 - betas.double(), dim=0).clamp(1e-12, 1 - 1e-12)
+    log_snr = torch.log(alpha_bar) - torch.log1p(-alpha_bar)
+    alpha_bar_new = torch.sigmoid(log_snr - 2.0 * math.log(shift))
+    prev = torch.cat([torch.ones(1, dtype=alpha_bar_new.dtype), alpha_bar_new[:-1]])
+    return (1 - alpha_bar_new / prev).clamp(min=1e-5, max=0.999).float()
+
+
 def _linear_beta_schedule(T: int, beta_start: float = 1e-4, beta_end: float = 0.02) -> torch.Tensor:
     return torch.linspace(beta_start, beta_end, T)
 
@@ -70,6 +79,12 @@ class EmbeddingDDPM(nn.Module):
         decode_metric: str = "dot",
         x0_ce_weight: float = 0.0,
         sample_method: str = "ddpm",
+        embed_dim: Optional[int] = None,
+        snr_shift: float = 1.0,
+        parameterization: str = "eps",
+        cond_tokens: bool = False,
+        cond_dropout: float = 0.0,
+        guidance_scale: float = 0.0,
     ):
         super().__init__()
         if backbone not in {"transformer", "mlp"}:
@@ -82,6 +97,10 @@ class EmbeddingDDPM(nn.Module):
             raise ValueError(f"Unsupported decode_metric={decode_metric!r}")
         if sample_method not in {"ddpm", "ddim"}:
             raise ValueError(f"Unsupported sample_method={sample_method!r}")
+        if parameterization not in {"eps", "x0"}:
+            raise ValueError(f"Unsupported parameterization={parameterization!r}")
+        if cond_dropout > 0 and not cond_tokens:
+            raise ValueError("cond_dropout requires cond_tokens=True (needs a null condition token).")
         self.features_info = list(features_info)
         self.cond_info = list(cond_info)
         self.T = int(T)
@@ -97,11 +116,19 @@ class EmbeddingDDPM(nn.Module):
         self.decode_metric = decode_metric
         self.x0_ce_weight = float(x0_ce_weight)
         self.sample_method = sample_method
+        # Diffusion-space width per feature. None keeps the legacy behaviour (= d_model).
+        self.embed_dim = int(embed_dim) if embed_dim else self.d_model
+        # log-SNR shift: logSNR'(t) = logSNR(t) - 2 log(snr_shift). >1 adds noise earlier.
+        self.snr_shift = float(snr_shift)
+        self.parameterization = parameterization
+        self.cond_tokens = bool(cond_tokens)
+        self.cond_dropout = float(cond_dropout)
+        self.guidance_scale = float(guidance_scale)
         self.feat_names = [f["name"] for f in self.features_info]
         self.num_features = len(self.feat_names)
 
         self.feature_embeddings = nn.ModuleDict(
-            {f["name"]: nn.Embedding(f["num_classes"], self.d_model) for f in self.features_info}
+            {f["name"]: nn.Embedding(f["num_classes"], self.embed_dim) for f in self.features_info}
         )
         if self.feature_embedding_mode == "fixed":
             # DDPM assumes x0 has O(1) variance per coordinate. Fixed spherical
@@ -115,14 +142,14 @@ class EmbeddingDDPM(nn.Module):
                             feature["num_classes"], dtype=embedding.weight.dtype
                         ).unsqueeze(1)
                         frequencies = torch.arange(
-                            1, self.d_model // 2 + 1, dtype=embedding.weight.dtype
+                            1, self.embed_dim // 2 + 1, dtype=embedding.weight.dtype
                         ).unsqueeze(0)
                         angles = 2.0 * math.pi * positions * frequencies / feature["num_classes"]
                         codebook = torch.cat([torch.sin(angles), torch.cos(angles)], dim=1)
-                        codebook = codebook[:, : self.d_model]
+                        codebook = codebook[:, : self.embed_dim]
                     elif self.fixed_codebook_type == "structured":
                         random_matrix = torch.randn(
-                            self.d_model,
+                            self.embed_dim,
                             feature["num_classes"],
                             dtype=embedding.weight.dtype,
                         )
@@ -131,13 +158,19 @@ class EmbeddingDDPM(nn.Module):
                         codebook = embedding.weight
                     codebook = codebook - codebook.mean(dim=0, keepdim=True)
                     embedding.weight.copy_(
-                        F.normalize(codebook, dim=-1) * math.sqrt(self.d_model)
+                        F.normalize(codebook, dim=-1) * math.sqrt(self.embed_dim)
                     )
                 embedding.weight.requires_grad_(False)
         self.cond_embeddings = nn.ModuleDict(
             {c["name"]: nn.Embedding(c["num_classes"], 16) for c in self.cond_info}
         )
         self.cond_projector = nn.Linear(16 * max(len(self.cond_info), 1), self.d_model)
+        if self.cond_tokens:
+            # One token per conditioning field; index num_classes is the null (dropped) condition.
+            self.cond_token_embeddings = nn.ModuleDict(
+                {c["name"]: nn.Embedding(c["num_classes"] + 1, self.d_model) for c in self.cond_info}
+            )
+            self.cond_type_embed = nn.Parameter(torch.randn(1, len(self.cond_info), self.d_model) * 0.02)
         self.time_mlp = nn.Sequential(
             SinusoidalTimeEmbedding(self.d_model),
             nn.Linear(self.d_model, self.d_model * 4),
@@ -158,17 +191,27 @@ class EmbeddingDDPM(nn.Module):
                 activation="gelu",
             )
             self.denoiser = nn.TransformerEncoder(layer, num_layers=num_layers)
-            self.eps_head = nn.Linear(self.d_model, self.d_model)
+            self.in_proj = (
+                nn.Linear(self.embed_dim, self.d_model) if self.embed_dim != self.d_model else nn.Identity()
+            )
+            self.eps_head = nn.Linear(self.d_model, self.embed_dim)
         else:
             hidden = mlp_hidden or [512, 512, 512]
-            in_dim = self.num_features * self.d_model + self.d_model  # flat x_t + cond/time
-            dims = [in_dim] + list(hidden) + [self.num_features * self.d_model]
+            if self.cond_tokens or self.parameterization != "eps":
+                raise ValueError("cond_tokens / x0 parameterization are implemented for the transformer backbone only.")
+            in_dim = self.num_features * self.embed_dim + self.d_model  # flat x_t + cond/time
+            dims = [in_dim] + list(hidden) + [self.num_features * self.embed_dim]
             layers: List[nn.Module] = []
             for i in range(len(dims) - 2):
                 layers.extend([nn.Linear(dims[i], dims[i + 1]), nn.SiLU(), nn.Dropout(dropout)])
             layers.append(nn.Linear(dims[-2], dims[-1]))
             self.denoiser = nn.Sequential(*layers)
+            self.in_proj = nn.Identity()
             self.eps_head = nn.Identity()
+        if self.parameterization == "x0":
+            self.x0_heads = nn.ModuleDict(
+                {f["name"]: nn.Linear(self.d_model, f["num_classes"]) for f in self.features_info}
+            )
 
         if beta_schedule == "cosine":
             betas = _cosine_beta_schedule(self.T)
@@ -176,6 +219,8 @@ class EmbeddingDDPM(nn.Module):
             betas = _linear_beta_schedule(self.T)
         else:
             raise ValueError(f"Unknown beta_schedule={beta_schedule}")
+        if self.snr_shift != 1.0:
+            betas = _shift_betas(betas, self.snr_shift)
 
         alphas = 1.0 - betas
         alpha_bar = torch.cumprod(alphas, dim=0)
@@ -231,26 +276,77 @@ class EmbeddingDDPM(nn.Module):
         so = self.sqrt_one_minus_alpha_bar[t].view(-1, 1, 1)
         return sa * x0 + so * noise, noise
 
-    def predict_eps(self, x_t: torch.Tensor, cond_ids: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-        cond_ctx = self.encode_cond(cond_ids)
+    def _null_cond(self, cond_ids: torch.Tensor) -> torch.Tensor:
+        null = torch.tensor([c["num_classes"] for c in self.cond_info], device=cond_ids.device)
+        return null.unsqueeze(0).expand_as(cond_ids)
+
+    def _hidden(self, x_t: torch.Tensor, cond_ids: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        """Shared denoiser trunk; returns (B, F, d_model) hidden states for the feature tokens."""
         t_emb = self.time_mlp(t)
-        global_ctx = cond_ctx + t_emb
         if self.backbone_type == "transformer":
-            tokens = x_t + self.feature_pos_embed
-            global_token = global_ctx.unsqueeze(1)
-            hidden = self.denoiser(torch.cat([global_token, tokens], dim=1))
-            return self.eps_head(hidden[:, 1:, :])
-        flat = torch.cat([x_t.reshape(x_t.size(0), -1), global_ctx], dim=1)
-        pred = self.denoiser(flat)
-        return pred.view_as(x_t)
+            tokens = self.in_proj(x_t) + self.feature_pos_embed
+            if self.cond_tokens:
+                cond_tok = torch.stack(
+                    [self.cond_token_embeddings[c["name"]](cond_ids[:, j]) for j, c in enumerate(self.cond_info)],
+                    dim=1,
+                ) + self.cond_type_embed
+                prefix = torch.cat([t_emb.unsqueeze(1), cond_tok], dim=1)
+            else:
+                prefix = (self.encode_cond(cond_ids) + t_emb).unsqueeze(1)
+            hidden = self.denoiser(torch.cat([prefix, tokens], dim=1))
+            return hidden[:, prefix.size(1):, :]
+        flat = torch.cat([x_t.reshape(x_t.size(0), -1), self.encode_cond(cond_ids) + t_emb], dim=1)
+        return self.denoiser(flat).view_as(x_t)
+
+    def _x0_logits(self, hidden: torch.Tensor) -> List[torch.Tensor]:
+        return [self.x0_heads[name](hidden[:, i, :]) for i, name in enumerate(self.feat_names)]
+
+    def _expected_embedding(self, logits: List[torch.Tensor]) -> torch.Tensor:
+        return torch.stack(
+            [F.softmax(lg, dim=-1) @ self.feature_embeddings[name].weight for lg, name in zip(logits, self.feat_names)],
+            dim=1,
+        )
+
+    def predict_eps(self, x_t: torch.Tensor, cond_ids: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        """Epsilon prediction (eps parameterization only; kept for legacy callers)."""
+        return self.eps_head(self._hidden(x_t, cond_ids, t))
+
+    def predict_x0(self, x_t: torch.Tensor, cond_ids: torch.Tensor, t: torch.Tensor):
+        """Return (x0_hat embedding, per-feature logits or None) under either parameterization."""
+        hidden = self._hidden(x_t, cond_ids, t)
+        if self.parameterization == "x0":
+            logits = self._x0_logits(hidden)
+            return self._expected_embedding(logits), logits
+        eps = self.eps_head(hidden)
+        sa = self.sqrt_alpha_bar[t].view(-1, 1, 1).clamp(min=1e-8)
+        so = self.sqrt_one_minus_alpha_bar[t].view(-1, 1, 1)
+        return (x_t - so * eps) / sa, None
+
+    def _guided_x0(self, x_t: torch.Tensor, cond_ids: torch.Tensor, t: torch.Tensor):
+        x0, logits = self.predict_x0(x_t, cond_ids, t)
+        w = self.guidance_scale
+        if w <= 0 or not self.cond_tokens:
+            return x0, logits
+        x0_u, logits_u = self.predict_x0(x_t, self._null_cond(cond_ids), t)
+        if logits is not None:
+            logits = [(1 + w) * lc - w * lu for lc, lu in zip(logits, logits_u)]
+            return self._expected_embedding(logits), logits
+        return (1 + w) * x0 - w * x0_u, None
 
     def forward_loss(self, x_ids: torch.Tensor, cond_ids: torch.Tensor) -> torch.Tensor:
         bsz = x_ids.size(0)
         device = x_ids.device
         t = torch.randint(0, self.T, (bsz,), device=device, dtype=torch.long)
+        if self.cond_dropout > 0 and self.training:
+            drop = torch.rand(bsz, device=device) < self.cond_dropout
+            cond_ids = torch.where(drop.unsqueeze(1), self._null_cond(cond_ids), cond_ids)
         x0 = self.encode_features(x_ids)
         x_t, noise = self.q_sample(x0, t)
-        pred = self.predict_eps(x_t, cond_ids, t)
+        hidden = self._hidden(x_t, cond_ids, t)
+        if self.parameterization == "x0":
+            logits = self._x0_logits(hidden)
+            return torch.stack([F.cross_entropy(lg, x_ids[:, i]) for i, lg in enumerate(logits)]).mean()
+        pred = self.eps_head(hidden)
         loss = F.mse_loss(pred, noise)
         if self.x0_ce_weight > 0:
             sa = self.sqrt_alpha_bar[t].view(-1, 1, 1).clamp(min=1e-4)
@@ -271,39 +367,43 @@ class EmbeddingDDPM(nn.Module):
         return loss
 
     @torch.no_grad()
-    def p_sample(self, x_t: torch.Tensor, cond_ids: torch.Tensor, t: int) -> torch.Tensor:
-        bsz = x_t.size(0)
-        device = x_t.device
-        t_batch = torch.full((bsz,), t, device=device, dtype=torch.long)
-        eps = self.predict_eps(x_t, cond_ids, t_batch)
-        beta_t = self.betas[t]
-        alpha_t = self.alphas[t]
-        alpha_bar_t = self.alpha_bar[t]
-        mean = (1.0 / torch.sqrt(alpha_t)) * (
-            x_t - (beta_t / torch.sqrt(1.0 - alpha_bar_t).clamp(min=1e-8)) * eps
-        )
+    def p_sample(self, x_t: torch.Tensor, cond_ids: torch.Tensor, t: int):
+        """Ancestral step via the posterior q(x_{t-1} | x_t, x0_hat). Returns (x_{t-1}, logits).
+
+        For the eps parameterization this equals the standard DDPM mean
+        1/sqrt(alpha_t) * (x_t - beta_t / sqrt(1 - alpha_bar_t) * eps).
+        """
+        t_batch = torch.full((x_t.size(0),), t, device=x_t.device, dtype=torch.long)
+        if self.parameterization == "eps" and not (self.guidance_scale > 0 and self.cond_tokens):
+            # Legacy epsilon form, kept bit-for-bit so earlier checkpoints reproduce exactly.
+            eps = self.predict_eps(x_t, cond_ids, t_batch)
+            mean = (1.0 / torch.sqrt(self.alphas[t])) * (
+                x_t - (self.betas[t] / torch.sqrt(1.0 - self.alpha_bar[t]).clamp(min=1e-8)) * eps
+            )
+            if t == 0:
+                return mean, None
+            return mean + torch.sqrt(self.posterior_variance[t]) * torch.randn_like(x_t), None
+        x0, logits = self._guided_x0(x_t, cond_ids, t_batch)
         if t == 0:
-            return mean
-        noise = torch.randn_like(x_t)
-        return mean + torch.sqrt(self.posterior_variance[t]) * noise
+            return x0, logits
+        ab_t = self.alpha_bar[t]
+        ab_prev = self.alpha_bar[t - 1]
+        coef_x0 = torch.sqrt(ab_prev) * self.betas[t] / (1.0 - ab_t)
+        coef_xt = torch.sqrt(self.alphas[t]) * (1.0 - ab_prev) / (1.0 - ab_t)
+        mean = coef_x0 * x0 + coef_xt * x_t
+        return mean + torch.sqrt(self.posterior_variance[t]) * torch.randn_like(x_t), logits
 
     @torch.no_grad()
-    def ddim_sample(self, x_t: torch.Tensor, cond_ids: torch.Tensor, t: int) -> torch.Tensor:
-        """Deterministic DDIM step; useful when the reverse chain has few steps."""
-        bsz = x_t.size(0)
-        t_batch = torch.full((bsz,), t, device=x_t.device, dtype=torch.long)
-        eps = self.predict_eps(x_t, cond_ids, t_batch)
-        alpha_bar_t = self.alpha_bar[t]
-        x0_pred = (
-            x_t - torch.sqrt(1.0 - alpha_bar_t) * eps
-        ) / torch.sqrt(alpha_bar_t).clamp(min=1e-8)
+    def ddim_sample(self, x_t: torch.Tensor, cond_ids: torch.Tensor, t: int):
+        """Deterministic DDIM step. Returns (x_{t-1}, logits)."""
+        t_batch = torch.full((x_t.size(0),), t, device=x_t.device, dtype=torch.long)
+        x0, logits = self._guided_x0(x_t, cond_ids, t_batch)
         if t == 0:
-            return x0_pred
-        alpha_bar_prev = self.alpha_bar[t - 1]
-        return (
-            torch.sqrt(alpha_bar_prev) * x0_pred
-            + torch.sqrt(1.0 - alpha_bar_prev) * eps
-        )
+            return x0, logits
+        ab_t = self.alpha_bar[t]
+        eps = (x_t - torch.sqrt(ab_t) * x0) / torch.sqrt(1.0 - ab_t).clamp(min=1e-8)
+        ab_prev = self.alpha_bar[t - 1]
+        return torch.sqrt(ab_prev) * x0 + torch.sqrt(1.0 - ab_prev) * eps, logits
 
     @torch.no_grad()
     def sample(
@@ -314,15 +414,21 @@ class EmbeddingDDPM(nn.Module):
     ) -> torch.Tensor:
         device = cond_ids.device
         bsz = cond_ids.size(0)
-        x = torch.randn(bsz, self.num_features, self.d_model, device=device)
+        x = torch.randn(bsz, self.num_features, self.embed_dim, device=device)
         steps = range(self.T - 1, -1, -1)
         if progress:
             steps = tqdm(list(steps), desc="Embedding-DDPM sample", leave=False)
+        logits = None
+        step = self.ddim_sample if self.sample_method == "ddim" else self.p_sample
         for t in steps:
-            if self.sample_method == "ddim":
-                x = self.ddim_sample(x, cond_ids, t)
-            else:
-                x = self.p_sample(x, cond_ids, t)
+            x, logits = step(x, cond_ids, t)
+        if logits is not None:
+            # x0 parameterization: read the final categorical prediction directly.
+            if temperature and temperature > 0:
+                return torch.stack(
+                    [torch.multinomial(F.softmax(lg / temperature, dim=-1), 1).squeeze(1) for lg in logits], dim=1
+                )
+            return torch.stack([lg.argmax(dim=-1) for lg in logits], dim=1)
         return self.decode_features(x, temperature=temperature)
 
 
@@ -398,6 +504,12 @@ def train_embedding_ddpm(
                         "decode_metric": model.decode_metric,
                         "x0_ce_weight": model.x0_ce_weight,
                         "sample_method": model.sample_method,
+                        "embed_dim": model.embed_dim,
+                        "snr_shift": model.snr_shift,
+                        "parameterization": model.parameterization,
+                        "cond_tokens": model.cond_tokens,
+                        "cond_dropout": model.cond_dropout,
+                        "guidance_scale": model.guidance_scale,
                     },
                     model_save_path,
                 )

@@ -279,8 +279,34 @@ class TripDiffusionModel(nn.Module):
         d_model=128,
         shared_layers=2,
         causal_layers=2,
+        cond_tokens=False,
+        cond_dropout=0.0,
+        schedule_refine=1,
+        absorbing=False,
     ):
+        """Extra options (defaults reproduce the paper model exactly):
+
+        cond_tokens: one token per demographic (+ a timestep token) instead of a
+            single projected cond+t token. Each cond vocabulary gets an extra null id.
+        cond_dropout: probability of replacing a row's conditions by the null ids
+            during training (requires cond_tokens).
+        schedule_refine: split each step of the base T/schedule_refine-step schedule
+            into `schedule_refine` sub-steps that compose to the same marginal noise
+            path, so only the reverse-process discretisation changes.
+        absorbing: absorbing-state (masking) D3PM instead of uniform/Gaussian-kernel
+            noise. Each feature gets an extra [MASK] id (= num_classes); a token
+            survives to step t with probability alpha_bar_t = 1 - t/T.
+        """
         super().__init__()
+        if cond_dropout > 0 and not cond_tokens:
+            raise ValueError("cond_dropout > 0 requires cond_tokens=True (null condition ids).")
+        schedule_refine = int(schedule_refine)
+        if schedule_refine < 1 or T % schedule_refine != 0:
+            raise ValueError(f"T={T} must be a positive multiple of schedule_refine={schedule_refine}.")
+        self.cond_tokens = bool(cond_tokens)
+        self.cond_dropout = float(cond_dropout)
+        self.schedule_refine = schedule_refine
+        self.sample_temperature = 1.0
         gate_init = dict(gate_init or {})
         if freeze_gates:
             gate_init["freeze"] = True
@@ -332,15 +358,26 @@ class TripDiffusionModel(nn.Module):
         self.st_cascade_phase1_names = list(phase1_names)
         self.st_cascade_phase2_names = list(phase2_names)
 
+        self.absorbing = bool(absorbing)
+        if self.absorbing:
+            self.mask_token_ids = {f["name"]: f["num_classes"] for f in features_info}
+            self.register_buffer("absorb_alpha_bar", 1.0 - torch.arange(T + 1, dtype=torch.float32) / T)
         self.feature_embeddings = nn.ModuleDict()
         for feat in features_info:
-            self.feature_embeddings[feat["name"]] = nn.Embedding(feat["num_classes"], self.d_model)
+            n_states = feat["num_classes"] + (1 if self.absorbing else 0)
+            self.feature_embeddings[feat["name"]] = nn.Embedding(n_states, self.d_model)
         self.feature_pos_embed = nn.Parameter(torch.randn(1, len(self.feat_names), self.d_model) * 0.02)
 
         self.cond_embeddings = nn.ModuleDict()
         for cond in cond_info:
             self.cond_embeddings[cond["name"]] = nn.Embedding(cond["num_classes"], 16)
         self.cond_projector = nn.Linear(16 * len(cond_info), self.d_model)
+        if self.cond_tokens:
+            # Separate per-field tokens; last id of each vocabulary is the null condition.
+            self.cond_token_embeddings = nn.ModuleDict(
+                {c["name"]: nn.Embedding(c["num_classes"] + 1, self.d_model) for c in cond_info}
+            )
+            self.cond_type_embed = nn.Parameter(torch.randn(1, len(cond_info), self.d_model) * 0.02)
         self.time_embedding = nn.Embedding(T + 1, self.d_model)
 
         shared_layer = nn.TransformerEncoderLayer(
@@ -384,8 +421,11 @@ class TripDiffusionModel(nn.Module):
                 self.joint_head_pairs.append((feat1["name"], feat2["name"]))
 
         # Diffusion schedule
-        beta_schedule = torch.linspace(0.1, 0.5, steps=T)
-        sigma_schedule = torch.linspace(5.0, 50.0, steps=T)
+        base_T = T // schedule_refine
+        beta_schedule = torch.linspace(0.1, 0.5, steps=base_T).repeat_interleave(schedule_refine)
+        sigma_schedule = torch.linspace(5.0, 50.0, steps=base_T).repeat_interleave(schedule_refine)
+        # Gaussian kernels compose by adding variances.
+        sigma_schedule = sigma_schedule / (schedule_refine ** 0.5)
         self.register_buffer("beta_schedule", beta_schedule)
         self.register_buffer("sigma_schedule", sigma_schedule)
 
@@ -411,6 +451,13 @@ class TripDiffusionModel(nn.Module):
                     if K == 1:
                         q_t = torch.eye(1)
                     else:
+                        if schedule_refine > 1:
+                            # Q = lam*I + (1-lam)/K * J with lam = 1 - beta*K/(K-1);
+                            # k sub-steps with lam^(1/k) compose to the base step.
+                            lam = 1.0 - beta_t * K / (K - 1)
+                            if lam <= 0:
+                                raise ValueError(f"beta={beta_t} too large to refine for K={K}")
+                            beta_t = (1.0 - lam ** (1.0 / schedule_refine)) * (K - 1) / K
                         q_t = torch.full((K, K), beta_t / (K - 1))
                         q_t.fill_diagonal_(1 - beta_t)
                 elif feat_type == "ordinal":
@@ -476,19 +523,31 @@ class TripDiffusionModel(nn.Module):
             feat_tokens.append(self.feature_embeddings[name](x_t[:, idx]))
         feat_tokens = torch.stack(feat_tokens, dim=1) + self.feature_pos_embed
 
-        cond_embeds = []
-        for j, cond_feat in enumerate(self.cond_info):
-            name = cond_feat["name"]
-            cond_embeds.append(self.cond_embeddings[name](cond[:, j]))
-        cond_raw = torch.cat(cond_embeds, dim=1)
-        cond_ctx = self.cond_projector(cond_raw)
         t_emb = self.time_embedding(t)
-        global_token = (cond_ctx + t_emb).unsqueeze(1)
+        if self.cond_tokens:
+            if self.training and self.cond_dropout > 0:
+                null = torch.tensor([c["num_classes"] for c in self.cond_info], device=cond.device)
+                drop = torch.rand(cond.size(0), device=cond.device) < self.cond_dropout
+                cond = torch.where(drop.unsqueeze(1), null.unsqueeze(0).expand_as(cond), cond)
+            cond_tok = torch.stack(
+                [self.cond_token_embeddings[c["name"]](cond[:, j]) for j, c in enumerate(self.cond_info)],
+                dim=1,
+            ) + self.cond_type_embed
+            prefix = torch.cat([t_emb.unsqueeze(1), cond_tok], dim=1)
+        else:
+            cond_embeds = []
+            for j, cond_feat in enumerate(self.cond_info):
+                name = cond_feat["name"]
+                cond_embeds.append(self.cond_embeddings[name](cond[:, j]))
+            cond_raw = torch.cat(cond_embeds, dim=1)
+            cond_ctx = self.cond_projector(cond_raw)
+            prefix = (cond_ctx + t_emb).unsqueeze(1)
 
-        shared_tokens = torch.cat([global_token, feat_tokens], dim=1)
+        n_prefix = prefix.size(1)
+        shared_tokens = torch.cat([prefix, feat_tokens], dim=1)
         shared_hidden = self.shared_encoder(shared_tokens)
-        h_cond = shared_hidden[:, :1, :]
-        h_shared = shared_hidden[:, 1:, :]
+        h_cond = shared_hidden[:, :n_prefix, :]
+        h_shared = shared_hidden[:, n_prefix:, :]
 
         h_act = h_shared[:, self.group_act_idx, :]
         h_st = h_shared[:, self.group_st_idx, :]

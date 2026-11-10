@@ -262,6 +262,30 @@ def train_model(model, optimizer, dataset, features_info,
             else:
                 t_batch = torch.multinomial(t_probs, bsz, replacement=True).to(device) + 1
 
+            if getattr(attr_model, "absorbing", False):
+                # Absorbing-state D3PM: mask each token with prob 1 - alpha_bar_t,
+                # cross-entropy on x0 at masked positions only.
+                keep = attr_model.absorb_alpha_bar[t_batch].unsqueeze(1)
+                masked = torch.rand(x0_batch.shape, device=device) >= keep
+                mask_ids = torch.tensor(
+                    [attr_model.mask_token_ids[f["name"]] for f in features_info], device=device
+                )
+                x_t = torch.where(masked, mask_ids.unsqueeze(0).expand_as(x0_batch), x0_batch)
+                logits, _ = model(x_t, cond_batch, t_batch)
+                loss = 0.0
+                n_masked = masked.sum().clamp(min=1)
+                for feat_index, feat in enumerate(features_info):
+                    feat_w = float(feature_loss_weights.get(feat["name"], 1.0))
+                    ce = F.cross_entropy(logits[feat["name"]], x0_batch[:, feat_index], reduction="none")
+                    loss = loss + feat_w * (ce * masked[:, feat_index]).sum()
+                loss = loss / n_masked
+                pbar.set_postfix({'loss': f'{loss.item():.2f}'})
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                total_loss += loss.item() * bsz
+                continue
+
             # run your forward diffusion to get x_t and x_{t-1}
             x_t_minus_1_list = []
             x_t_list = []
@@ -590,6 +614,55 @@ def _apply_joint_pair_gibbs(
     return x_refined
 
 
+@torch.no_grad()
+def _absorbing_sample(attr_model, model, cond_batch, device):
+    """Reverse absorbing D3PM: start fully masked; at step t each still-masked token
+    is revealed with prob (ab_{t-1} - ab_t) / (1 - ab_t), drawn from p_theta(x0 | x_t).
+
+    sample_unmask='confidence' instead reveals, per row, the same expected number of
+    tokens but chooses the masked tokens whose drawn value has the highest model
+    probability (MaskGIT-style ordering)."""
+    feats = attr_model.features_info
+    bsz = cond_batch.size(0)
+    mask_ids = torch.tensor([attr_model.mask_token_ids[f["name"]] for f in feats], device=device)
+    x = mask_ids.unsqueeze(0).repeat(bsz, 1)
+    ab = attr_model.absorb_alpha_bar
+    temperature = float(getattr(attr_model, "sample_temperature", 1.0))
+    unmask_rule = getattr(attr_model, "sample_unmask", "random")
+    for t in range(attr_model.T, 0, -1):
+        t_batch = torch.full((bsz,), t, device=device, dtype=torch.long)
+        logits, _ = model(x, cond_batch, t_batch)
+        draws, conf = [], []
+        for f in feats:
+            p = F.softmax(logits[f["name"]] / temperature, dim=1)
+            v = torch.multinomial(p, 1)
+            draws.append(v.squeeze(1))
+            conf.append(p.gather(1, v).squeeze(1))
+        draws = torch.stack(draws, dim=1)
+        is_masked = x == mask_ids.unsqueeze(0)
+        p_reveal = float((ab[t - 1] - ab[t]) / (1.0 - ab[t]))
+        if t == 1:
+            reveal = is_masked
+        elif unmask_rule in ("confidence", "cascade"):
+            n_reveal = torch.binomial(is_masked.sum(1).float(), torch.full((bsz,), p_reveal, device=device)).long()
+            if unmask_rule == "confidence":
+                score = torch.stack(conf, dim=1)
+            else:
+                # act -> ST phase1 -> ST phase2 -> mode; earlier = higher score.
+                order = (list(attr_model.group_act_names) + list(attr_model.st_cascade_phase1_names)
+                         + list(attr_model.st_cascade_phase2_names) + list(attr_model.group_mode_names))
+                prio = torch.tensor([len(order) - order.index(f["name"]) for f in feats],
+                                    device=device, dtype=torch.float32)
+                score = prio.unsqueeze(0).expand(bsz, -1)
+            score = score.masked_fill(~is_masked, -1e9)
+            rank = score.argsort(dim=1, descending=True).argsort(dim=1)
+            reveal = is_masked & (rank < n_reveal.unsqueeze(1))
+        else:
+            reveal = is_masked & (torch.rand(x.shape, device=device) < p_reveal)
+        x = torch.where(reveal, draws, x)
+    return x
+
+
 def fast_sample_trips(
     model,
     cond_batch,
@@ -613,6 +686,8 @@ def fast_sample_trips(
     model.eval()
     bsz = cond_batch.shape[0]
     num_features = len(attr_model.features_info)
+    if getattr(attr_model, "absorbing", False):
+        return _absorbing_sample(attr_model, model, cond_batch, device)
     mask_token_ids = getattr(attr_model, "mask_token_ids", None)
     
     # 1. Initialize x_T randomly
@@ -650,6 +725,9 @@ def fast_sample_trips(
                 # Get current Batch's x_t values and predicted p(x0)
                 curr_x_t = x_t[:, feat_index]            # (B,)
                 logits_feat = logits[name]               # (B, K)
+                temperature = float(getattr(attr_model, "sample_temperature", 1.0))
+                if temperature != 1.0:
+                    logits_feat = logits_feat / temperature
                 p_theta = F.softmax(logits_feat, dim=1)  # (B, K) -> predicted p(x0)
 
                 # Get matrices (from buffer or list)
@@ -689,8 +767,11 @@ def fast_sample_trips(
                 # Handle NaNs due to numerical instability
                 out_probs = torch.where(torch.isnan(out_probs), torch.ones_like(out_probs)/state_dim, out_probs)
 
-                # Batch Multinomial Sampling
-                next_val = torch.multinomial(out_probs, 1).squeeze(1) # (B,)
+                # Batch Multinomial Sampling (optionally a deterministic final denoising step)
+                if t == 1 and getattr(attr_model, "sample_final", "sample") == "argmax":
+                    next_val = out_probs.argmax(dim=1)
+                else:
+                    next_val = torch.multinomial(out_probs, 1).squeeze(1) # (B,)
                 x_prev_list.append(next_val)
 
             # Update x_t

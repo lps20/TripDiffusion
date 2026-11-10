@@ -166,7 +166,14 @@ def run_once(args, seed, exp_dir):
         d_model=d_model,
         shared_layers=shared_layers,
         causal_layers=causal_layers,
+        cond_tokens=args.cond_tokens,
+        cond_dropout=args.cond_dropout,
+        schedule_refine=args.schedule_refine,
+        absorbing=args.absorbing,
     ).to(device)
+    model.sample_temperature = float(args.sample_temperature)
+    model.sample_final = args.sample_final
+    model.sample_unmask = args.sample_unmask
     num_params = sum(p.numel() for p in model.parameters())
     logging.info("Model parameters: %d (%.2f M)", num_params, num_params / 1e6)
     if args.hard_stream_cascade:
@@ -327,6 +334,13 @@ def run_once(args, seed, exp_dir):
         "shared_layers": int(shared_layers),
         "causal_layers": int(causal_layers),
         "num_parameters": int(num_params),
+        "cond_tokens": bool(args.cond_tokens),
+        "cond_dropout": float(args.cond_dropout),
+        "schedule_refine": int(args.schedule_refine),
+        "sample_temperature": float(args.sample_temperature),
+        "sample_final": args.sample_final,
+        "absorbing": bool(args.absorbing),
+        "sample_unmask": args.sample_unmask,
         "sampling_seconds": sampling_seconds,
         "sampling_seconds_per_10k": float(sampling_seconds * (10000.0 / max(float(num_generated), 1.0))),
         "evaluation": eva_all,
@@ -515,6 +529,13 @@ if __name__ == "__main__":
         ],
         help="ST cascade token order preset (only used with --st_cascade).",
     )
+    parser.add_argument("--cond_tokens", action="store_true", help="One token per demographic instead of a single projected cond token.")
+    parser.add_argument("--cond_dropout", type=float, default=0.0, help="Row-level condition dropout to null ids (requires --cond_tokens).")
+    parser.add_argument("--schedule_refine", type=int, default=1, help="Split each base-schedule step into k sub-steps (T must be a multiple of k).")
+    parser.add_argument("--sample_temperature", type=float, default=1.0, help="Temperature on predicted p(x0) logits at every reverse step.")
+    parser.add_argument("--absorbing", action="store_true", help="Absorbing-state (masking) D3PM noise instead of uniform/Gaussian-kernel.")
+    parser.add_argument("--sample_unmask", type=str, default="random", choices=["random", "confidence", "cascade"], help="Absorbing only: which masked tokens to reveal at each reverse step.")
+    parser.add_argument("--sample_final", type=str, default="sample", choices=["sample", "argmax"], help="Final reverse step (t=1 -> x0): multinomial sample or argmax denoise.")
     parser.add_argument("--metrics_file", type=str, default=None, help="Path to write metrics JSON (default: <exp_dir>/generated_samples_metrics.json)")
     add_multiseed_arguments(parser, default_num_seeds=5)
 
