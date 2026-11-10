@@ -997,6 +997,13 @@ def _append_summary(output_dir: str, rows: List[Dict[str, Any]]) -> None:
         new_df.to_csv(summary_path, index=False)
 
 
+def _budget_steps(args: argparse.Namespace, n_rows: int) -> int:
+    """Gradient-step budget: --max_steps if given, else epochs x ceil(n / batch)."""
+    if getattr(args, "max_steps", 0) and args.max_steps > 0:
+        return int(args.max_steps)
+    return int(args.epochs * max(1, -(-n_rows // args.batch_size)))
+
+
 def _run_model_for_seed(
     model_name: str,
     args: argparse.Namespace,
@@ -1028,6 +1035,38 @@ def _run_model_for_seed(
             batch_size=args.batch_size,
             model_save_path=model_paths["tvae"] if save_models else None,
         )
+    if model_name in ("ctgan_cond", "tvae_cond"):
+        from conditional_ctgan_tvae import ConditionalCTGAN, ConditionalTVAE
+
+        _set_seed(seed)
+        cond_sizes = {f["name"]: f["num_classes"] for f in FULL_SCHEMA if f["name"] in COND_COLUMNS}
+        steps = _budget_steps(args, len(train_df))
+        if model_name == "ctgan_cond":
+            model = ConditionalCTGAN(
+                COND_COLUMNS, cond_sizes, steps=steps,
+                embedding_dim=args.ctgan_embedding_dim,
+                generator_dim=tuple(args.ctgan_gen_dims),
+                discriminator_dim=tuple(args.ctgan_dis_dims),
+                generator_lr=args.ctgan_lr, discriminator_lr=args.ctgan_lr,
+                batch_size=args.batch_size, pac=args.ctgan_pac,
+            )
+        else:
+            model = ConditionalTVAE(
+                COND_COLUMNS, cond_sizes, steps=steps,
+                embedding_dim=args.tvae_latent_dim,
+                compress_dims=tuple(args.tvae_dims), decompress_dims=tuple(args.tvae_dims),
+                batch_size=args.batch_size, loss_factor=args.tvae_loss_factor, lr=args.tvae_lr,
+            )
+        model.fit_conditional(train_df, TRIP_COLUMNS)
+        if save_models:
+            import pickle
+
+            path = os.path.join(output_dir, f"{model_name.upper()}_model.pkl")
+            os.makedirs(output_dir, exist_ok=True)
+            with open(path, "wb") as f:
+                pickle.dump(model, f)
+            logging.info("Saved %s checkpoint: %s", model_name, path)
+        return model.sample_conditional(test_df.reset_index(drop=True))[ALL_COLUMNS]
     if model_name == "tabddpm":
         from tab_ddpm_baseline import run_tabddpm
 
@@ -1153,8 +1192,15 @@ def main(args: argparse.Namespace) -> None:
         if missing:
             raise ValueError(f"{dataset_name} dataset missing columns: {sorted(missing)}")
 
+    if args.max_steps and args.max_steps > 0:
+        # Epoch-based models get the epoch count that matches the step budget.
+        steps_per_epoch = max(1, -(-len(train_df) // args.batch_size))
+        args.epochs = max(1, -(-args.max_steps // steps_per_epoch))
+        logging.info("Step budget %d -> %d epochs for epoch-based models (%d steps/epoch).",
+                     args.max_steps, args.epochs, steps_per_epoch)
+
     per_seed_rows: List[Dict[str, Any]] = []
-    conditional_models = {"ddpm_tf", "ddpm_mlp", "tabddpm_tf"}
+    conditional_models = {"ddpm_tf", "ddpm_mlp", "tabddpm_tf", "ctgan_cond", "tvae_cond"}
     if args.tabddpm_conditional:
         conditional_models = conditional_models | {"tabddpm"}
     if args.datgan_conditional:
@@ -1294,9 +1340,21 @@ if __name__ == "__main__":
         "--models",
         nargs="+",
         default=["datgan"],
-        choices=["ctgan", "tvae", "tabddpm", "tabddpm_tf", "datgan", "vae", "ddpm_tf", "ddpm_mlp"],
-        help="Which baselines to run.",
+        choices=["ctgan", "tvae", "tabddpm", "tabddpm_tf", "datgan", "vae", "ddpm_tf", "ddpm_mlp",
+                 "ctgan_cond", "tvae_cond"],
+        help="Which baselines to run. ctgan_cond / tvae_cond are the conditional C-CTGAN / C-TVAE.",
     )
+    parser.add_argument("--max_steps", type=int, default=0,
+                        help="Gradient-step budget shared by all models (0 = use --epochs).")
+    parser.add_argument("--ctgan_embedding_dim", type=int, default=128)
+    parser.add_argument("--ctgan_gen_dims", type=int, nargs="+", default=[256, 256])
+    parser.add_argument("--ctgan_dis_dims", type=int, nargs="+", default=[256, 256])
+    parser.add_argument("--ctgan_lr", type=float, default=2e-4)
+    parser.add_argument("--ctgan_pac", type=int, default=10)
+    parser.add_argument("--tvae_latent_dim", type=int, default=128)
+    parser.add_argument("--tvae_dims", type=int, nargs="+", default=[128, 128])
+    parser.add_argument("--tvae_loss_factor", type=float, default=2.0)
+    parser.add_argument("--tvae_lr", type=float, default=1e-3)
     parser.add_argument(
         "--num_samples",
         type=int,

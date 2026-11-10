@@ -90,9 +90,13 @@ def _fit_mnl(
     X: np.ndarray,
     y: np.ndarray,
     random_state: int,
+    scaler: Optional[StandardScaler] = None,
 ) -> Tuple[LogisticRegression, StandardScaler, np.ndarray]:
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
+    """Fit an MNL on standardized X. Pass a pre-fitted `scaler` so that TSTR and TRTR
+    coefficients live on the same (real-train) scale."""
+    if scaler is None:
+        scaler = StandardScaler().fit(X)
+    X_scaled = scaler.transform(X)
     model = LogisticRegression(
         solver="lbfgs",
         max_iter=2000,
@@ -152,7 +156,8 @@ def _average_marginal_effects(
 ) -> Dict[str, Dict[str, float]]:
     probs, model_classes = _predict_probabilities(model, scaler, X)
     class_to_idx = {int(c): i for i, c in enumerate(model_classes)}
-    coef = model.coef_
+    # Coefficients are per SD of the standardized input; convert to per raw unit.
+    coef = model.coef_ / scaler.scale_[None, :]
     ame: Dict[str, Dict[str, float]] = {str(c): {} for c in classes}
 
     for feat_idx, feat_name in enumerate(feature_names):
@@ -181,7 +186,7 @@ def _implied_arc_elasticities(
 ) -> Dict[str, Dict[str, float]]:
     probs, model_classes = _predict_probabilities(model, scaler, X)
     class_to_idx = {int(c): i for i, c in enumerate(model_classes)}
-    coef = model.coef_
+    coef = model.coef_ / scaler.scale_[None, :]  # per raw unit, consistent with x_bar
     x_means = {name: float(np.mean(X[:, i])) for i, name in enumerate(feature_names)}
     elasticities: Dict[str, Dict[str, float]] = {str(c): {} for c in classes}
 
@@ -264,8 +269,10 @@ def evaluate_mnl_mode_choice_validation(
     if not _is_usable_split(y_syn, y_te) or not _is_usable_split(y_tr, y_te):
         return _empty_result("insufficient_mode_class_support")
 
-    model_tstr, scaler_tstr, _ = _fit_mnl(X_syn, y_syn, random_state)
-    model_trtr, scaler_trtr, _ = _fit_mnl(X_tr, y_tr, random_state)
+    # One scaler fitted on real training data for both models (common coefficient scale).
+    shared_scaler = StandardScaler().fit(X_tr)
+    model_tstr, scaler_tstr, _ = _fit_mnl(X_syn, y_syn, random_state, scaler=shared_scaler)
+    model_trtr, scaler_trtr, _ = _fit_mnl(X_tr, y_tr, random_state, scaler=shared_scaler)
 
     coef_tstr, coef_trtr, shared_classes = _align_coefficients(model_tstr, model_trtr, MODE_CHOICE_FEATURES)
     if coef_tstr.size == 0:
@@ -295,6 +302,8 @@ def evaluate_mnl_mode_choice_validation(
 
     return {
         "mnl_status": "ok",
+        "mnl_scaler": "shared_real_train",
+        "mnl_effect_units": "raw",
         "mnl_behavioral_similarity": coef_cosine,
         "mnl_coef_cosine_similarity": coef_cosine,
         "mnl_coef_rmse": coef_rmse,

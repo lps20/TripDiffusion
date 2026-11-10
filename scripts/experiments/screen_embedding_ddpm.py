@@ -192,6 +192,7 @@ def main() -> None:
     ap.add_argument("--calibrate", action="store_true")
     ap.add_argument("--diagnose", default=None, help="Checkpoint path to diagnose only.")
     ap.add_argument("--force", action="store_true")
+    ap.add_argument("--config_json", default=None, help="JSON dict of extra named configs to add to CONFIGS.")
     args = ap.parse_args()
 
     out = Path(args.out)
@@ -204,7 +205,7 @@ def main() -> None:
     rng = np.random.default_rng(0)
     eval_idx = np.sort(rng.choice(len(test), size=min(args.eval_n, len(test)), replace=False))
     truth = test.iloc[eval_idx].reset_index(drop=True)
-    diag_df = truth.sample(2048, random_state=1)
+    diag_df = truth.sample(min(2048, len(truth)), random_state=1)
 
     if args.calibrate:
         calibrate(diag_df, device)
@@ -231,6 +232,9 @@ def main() -> None:
         else:
             logging.warning("Reference CSV is not row-aligned with the test set; skipped.")
 
+    if args.config_json:
+        # Extra named configs, e.g. '{"E01": {"T": 50, "embed_dim": 16, ...}}' (used by the tuning jobs).
+        CONFIGS.update(json.loads(args.config_json))
     names = args.configs or list(CONFIGS) + list(SAMPLE_VARIANTS)
     for name in names:
         cdir = out / name
